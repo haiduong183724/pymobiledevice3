@@ -737,8 +737,12 @@ class VncStreamServer(ScreenMirrorSession):
         await self.start()
         loop = asyncio.get_running_loop()
 
-        # 5) TCP listener for VNC clients.
-        server = await asyncio.start_server(self._handle_client, self._bind, self._port)
+        # 5) TCP listener for VNC clients. If it cannot listen, release the device stream.
+        try:
+            server = await asyncio.start_server(self._handle_client, self._bind, self._port)
+        except BaseException:
+            await self.stop()
+            raise
         stop_event = asyncio.Event()
 
         def _request_stop() -> None:

@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import pytest
 
 from pymobiledevice3.exceptions import CoreDeviceError, ScreenMirrorStopped
-from pymobiledevice3.remote.core_device import screen_mirror
+from pymobiledevice3.remote.core_device import screen_mirror, vnc_server
 from pymobiledevice3.remote.core_device.display_service import (
     MEDIA_IN_USE_ERROR_CODE,
     MEDIA_IN_USE_MESSAGE,
@@ -568,3 +568,29 @@ async def test_stop_during_a_failed_start_waits_for_its_teardown(device, rsd, fa
     assert isinstance(start.exception(), OSError)
     assert [t.closed for t in device.transports] == [1]
     assert await asyncio.wait_for(session.wait_stopped(), 0.01) is None
+
+
+async def test_cancelled_stop_still_closes_the_transport(device, rsd):
+    device.hang_close = True  # keeps stop() inside its bounded close step (3 s)
+    session = ScreenMirrorSession(rsd)
+    await session.start()
+    stopping = asyncio.create_task(session.stop())
+    while device.close_calls == 0:
+        await asyncio.sleep(0)
+    stopping.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(stopping, 1)
+    assert [t.closed for t in device.transports] == [1]
+
+
+async def test_serve_vnc_releases_the_stream_when_it_cannot_listen(device, rsd, monkeypatch):
+    async def cannot_listen(*args, **kwargs):
+        raise OSError("address already in use")
+
+    monkeypatch.setattr(vnc_server.asyncio, "start_server", cannot_listen)
+    server = VncStreamServer(rsd, port=0)
+    with pytest.raises(OSError, match="address already in use"):
+        await asyncio.wait_for(server.serve(), 2)
+    assert [t.closed for t in device.transports] == [1]
+    assert device.stop_all_streams_calls == 1
+    assert await asyncio.wait_for(server.wait_stopped(), 0.01) is None

@@ -1229,58 +1229,62 @@ class ScreenMirrorSession:
 
         ``start_exited`` is awaited within the same step as the connection closes, so waiting
         for a cancelled in-flight ``start()`` to unwind costs no extra time."""
-        logger.debug("shutdown: stopping background tasks")
-        tasks = [
-            t
-            for t in (
-                self._refresh_task,
-                self._rtcp_task,
-                self._feed_task,
-                self._audio_recv_task,
-                self._audio_rtcp_task,
-            )
-            if t is not None
-        ]
-        for task in tasks:
-            task.cancel()
-        for task in tasks:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
-        logger.debug("shutdown: stopping VT transcoder")
-        if self._transcoder is not None:
-            with contextlib.suppress(Exception):
-                self._transcoder.close()
-            self._transcoder = None
-        if self._audio_player is not None:
-            logger.debug("shutdown: stopping AudioQueue player")
-            with contextlib.suppress(Exception):
-                self._audio_player.close()
-            self._audio_player = None
-
-        # One bounded step: HID, the stream connections, the in-flight PLIs (they still use
-        # the transport) and a cancelled start() all wind down concurrently.
-        logger.debug("shutdown: closing HID and device stream connections")
-        steps: list[Awaitable[Any]] = [self._stop_hid(), self._drain_pli_tasks()]
-        if start_exited is not None:
-            steps.append(start_exited.wait())
-        for svc in (self._audio_svc, self._svc):
-            if svc is not None:
-                steps.append(svc.close())
-        await _await_bounded(
-            asyncio.gather(*steps, return_exceptions=True), STOP_STEP_TIMEOUT, "closing device connections"
-        )
-        self._uhs = None
-        self._indigo = None
-        self._svc = None
-        self._audio_svc = None
-        for task in list(self._pli_tasks):
-            task.cancel()
-        for transport in (self._transport, self._audio_transport):
-            if transport is not None:
+        try:
+            logger.debug("shutdown: stopping background tasks")
+            tasks = [
+                t
+                for t in (
+                    self._refresh_task,
+                    self._rtcp_task,
+                    self._feed_task,
+                    self._audio_recv_task,
+                    self._audio_rtcp_task,
+                )
+                if t is not None
+            ]
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+            logger.debug("shutdown: stopping VT transcoder")
+            if self._transcoder is not None:
                 with contextlib.suppress(Exception):
-                    transport.close()
-        self._transport = None
-        self._audio_transport = None
+                    self._transcoder.close()
+                self._transcoder = None
+            if self._audio_player is not None:
+                logger.debug("shutdown: stopping AudioQueue player")
+                with contextlib.suppress(Exception):
+                    self._audio_player.close()
+                self._audio_player = None
+
+            # One bounded step: HID, the stream connections, the in-flight PLIs (they still use
+            # the transport) and a cancelled start() all wind down concurrently.
+            logger.debug("shutdown: closing HID and device stream connections")
+            steps: list[Awaitable[Any]] = [self._stop_hid(), self._drain_pli_tasks()]
+            if start_exited is not None:
+                steps.append(start_exited.wait())
+            for svc in (self._audio_svc, self._svc):
+                if svc is not None:
+                    steps.append(svc.close())
+            await _await_bounded(
+                asyncio.gather(*steps, return_exceptions=True), STOP_STEP_TIMEOUT, "closing device connections"
+            )
+        finally:
+            # Synchronous, so it runs even when this teardown is cancelled: the sockets and the
+            # in-flight PLIs never outlive it.
+            self._uhs = None
+            self._indigo = None
+            self._svc = None
+            self._audio_svc = None
+            for task in list(self._pli_tasks):
+                task.cancel()
+            for transport in (self._transport, self._audio_transport):
+                if transport is not None:
+                    with contextlib.suppress(Exception):
+                        transport.close()
+            self._transport = None
+            self._audio_transport = None
 
         # Release the device-side session, so the device clears its
         # remote-observation state and frees the camera/microphone (see
