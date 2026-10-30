@@ -20,8 +20,9 @@ import struct
 import sys
 import uuid
 from collections import deque
+from collections.abc import Awaitable
 from types import TracebackType
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from pymobiledevice3.exceptions import CoreDeviceError
 from pymobiledevice3.remote.core_device.aac_eld import AACELDDecoder
@@ -46,8 +47,39 @@ from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscove
 
 logger = logging.getLogger(__name__)
 
+# Teardown bounds for :meth:`ScreenMirrorSession.stop`, which must return even when the device
+# is gone and every device call hangs: one step closes the HID and stream connections
+# concurrently, the next releases the device-side media session. Together they stay < 10 s.
+STOP_STEP_TIMEOUT = 3.0
+STOP_ALL_STREAMS_TIMEOUT = 6.0
+
 # ``(bgra, width, height)`` of a decoded frame; called on the event-loop thread.
 FrameCallback = Callable[[bytes, int, int], None]
+
+
+def _consume_task_result(task: "asyncio.Task[Any]") -> None:
+    if not task.cancelled():
+        task.exception()  # mark retrieved: a late failure of an abandoned call is expected
+
+
+async def _await_bounded(aw: Awaitable[Any], timeout: float, what: str) -> None:
+    """Await ``aw`` for at most ``timeout`` seconds, logging (not raising) a timeout or failure.
+
+    Unlike ``asyncio.wait_for`` (before Python 3.12), a timed-out call is cancelled but not
+    waited for, so a hung device call that does not honour cancellation cannot block teardown.
+    """
+    task = asyncio.ensure_future(aw)
+    task.add_done_callback(_consume_task_result)
+    try:
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    if not done:
+        task.cancel()
+        logger.warning("shutdown: %s did not finish within %.1f s", what, timeout)
+    elif not task.cancelled() and task.exception() is not None:
+        logger.debug("shutdown: %s failed", what, exc_info=task.exception())
 
 
 def _resolve_decoder(choice: str):
@@ -219,9 +251,20 @@ class ScreenMirrorSession:
         self._kb_service_id: Optional[int] = None
 
         self._on_frame = on_frame
-        # What ``start()`` created, for ``stop()`` to tear down.
-        self._started = False
+        # What ``start()`` created, for ``stop()`` to tear down. The session is single-use:
+        # ``_start_called`` / ``_stopped`` never reset.
+        self._start_called = False
+        self._started = False  # the device video stream is up
+        self._stream_requested = False  # start_video_stream was sent (the device may hold a session)
         self._stopped = False
+        # Set when an in-flight ``start()`` has unwound (or never ran), for ``stop()`` to wait on.
+        self._start_exited = asyncio.Event()
+        self._start_exited.set()
+        self._start_task: Optional[asyncio.Task[Any]] = None
+        # ``wait_stopped()``: set by ``stop()`` (or a failed ``start()``) and by the first
+        # failure of the video feed / RTCP task, which ``_failure`` then records.
+        self._stopped_event = asyncio.Event()
+        self._failure: Optional[BaseException] = None
         self._svc: Optional[DisplayService] = None
         self._transport: Optional[UdpMediaTransport] = None
         self._feed_task: Optional[asyncio.Task[None]] = None
@@ -244,6 +287,28 @@ class ScreenMirrorSession:
     async def wait_first_frame(self) -> None:
         """Wait until the first frame is decoded (and :attr:`frame_size` is known)."""
         await self._ready.wait()
+
+    async def wait_stopped(self) -> Optional[BaseException]:
+        """Wait until the session is over.
+
+        Returns ``None`` once :meth:`stop` has completed (or a failed :meth:`start` has unwound),
+        or the exception the video feed or its RTCP keepalive ended with -- e.g. an ``OSError``
+        when the device was unplugged. After a failure the session still needs :meth:`stop`.
+        """
+        await self._stopped_event.wait()
+        return self._failure
+
+    def _on_stream_task_done(self, task: "asyncio.Task[None]") -> None:
+        """Done-callback of the video feed / RTCP tasks: report the first one that dies."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        logger.warning("screen-mirror stream ended: %r", exc)
+        if self._failure is None:
+            self._failure = exc
+        self._stopped_event.set()
 
     async def __aenter__(self) -> "ScreenMirrorSession":
         await self.start()
@@ -326,7 +391,10 @@ class ScreenMirrorSession:
     # ----- RTP recv + transcoder feed ---------------------------------------
     async def _udp_recv_and_pipe(self, transport: UdpMediaTransport) -> None:
         """Same depacketize loop as ScreenStreamServer: gather Annex-B
-        AUs and feed the VT transcoder."""
+        AUs and feed the VT transcoder.
+
+        A socket-level receive error (``OSError``, e.g. the device went away) ends the task
+        with that exception, which :meth:`wait_stopped` reports."""
         loop = asyncio.get_running_loop()
         fu_buffer = bytearray()
         current_au: list[bytes] = []
@@ -344,7 +412,7 @@ class ScreenMirrorSession:
         while True:
             try:
                 data = await transport.recv()
-            except (OSError, asyncio.CancelledError):
+            except asyncio.CancelledError:
                 return
             if len(data) < 12:
                 continue
@@ -576,7 +644,10 @@ class ScreenMirrorSession:
     async def _rtcp_send_loop(self, transport: UdpMediaTransport) -> None:
         """Send a video RR every second to keep the device's video session
         alive (see _build_rtcp_rr). Not gated on packets-received: send from the
-        start so a brief no-frame window at bring-up can't let the session lapse."""
+        start so a brief no-frame window at bring-up can't let the session lapse.
+
+        A send error (``OSError``) ends the task with that exception, which
+        :meth:`wait_stopped` reports."""
         while True:
             try:
                 await asyncio.sleep(1.0)
@@ -588,7 +659,7 @@ class ScreenMirrorSession:
                 await transport.sendto(self._build_rtcp_rr(), *self._rtcp_dest)
             except OSError as exc:
                 logger.debug("video RTCP RR send failed (%s); socket may be torn down", exc)
-                return
+                raise
 
     def _fire_decoder_refresh(self, now: float, *, reason: str) -> None:
         """Arm the decoder-rebuild + PLI sequence. The recv loop will
@@ -894,7 +965,40 @@ class ScreenMirrorSession:
         """Start the device video (and optional audio) stream and the background tasks.
 
         Returns once the stream is negotiated; use :meth:`wait_first_frame` for the first frame.
+
+        The session is single-use: calling ``start()`` again, or after :meth:`stop`, raises
+        ``RuntimeError``. If ``start()`` fails, everything it created is closed before the
+        exception propagates, so no :meth:`stop` is needed. A concurrent :meth:`stop` cancels an
+        in-flight ``start()`` (a hung device call can never notice a flag): ``start()`` unwinds
+        and ``asyncio.CancelledError`` propagates to its caller.
         """
+        if self._start_called or self._stopped:
+            raise RuntimeError("ScreenMirrorSession is single-use: start() was already called or the session stopped")
+        self._start_called = True
+        self._start_task = asyncio.current_task()
+        self._start_exited.clear()
+        try:
+            await self._start_streams()
+        except BaseException as e:
+            if not self._stopped:
+                # A genuine failure, not stop() cancelling us (stop() tears down itself): unwind
+                # here. Release the device session only if the stream came up -- a rejected
+                # start_video_stream left nothing to release on the device.
+                self._stopped = True
+                await self._teardown(release_device=self._started)
+                self._stopped_event.set()
+            if isinstance(e, CoreDeviceError) and is_media_in_use_error(e):
+                # Camera/microphone in use: there is nothing to serve. Fail fast
+                # with a clean, actionable error (no traceback).
+                raise CoreDeviceError(MEDIA_IN_USE_MESSAGE, code=e.code) from None
+            raise
+        finally:
+            self._start_task = None
+            self._start_exited.set()
+
+    async def _start_streams(self) -> None:
+        """The body of :meth:`start`. Everything it creates goes on ``self`` as soon as it
+        exists, so :meth:`_teardown` can close it whenever this is interrupted."""
         # 1) Start device-side video stream + open the RTP receiver on the right transport:
         # the pytcp stack over the userspace tunnel (a host kernel socket is unreachable from
         # the device), a host kernel socket otherwise. Generate a single client_session_id up
@@ -902,31 +1006,20 @@ class ScreenMirrorSession:
         # device -- this is what Xcode's Mirror does.
         shared_session_id = uuid.uuid4()
         svc = DisplayService(self._rsd)
+        self._svc = svc
         await svc.connect()
         transport, receiver_ip = open_media_receiver(svc, (8 * 1024 * 1024, 4 * 1024 * 1024))
-        try:
-            answer = await svc.start_video_stream(
-                receiver_ip=receiver_ip,
-                receiver_port=transport.port,
-                sender_ip=self._sender_ip,
-                display_id=self._display_id,
-                client_session_id=shared_session_id,
-                allow_rtcp_fb=self._allow_rtcp_fb,
-                ltrp_enabled=self._ltrp_enabled,
-            )
-        except CoreDeviceError as e:
-            with contextlib.suppress(Exception):
-                await svc.close()
-            with contextlib.suppress(Exception):
-                transport.close()
-            # Camera/microphone in use: there is nothing to serve. Fail fast
-            # with a clean, actionable error (no traceback). No stream started,
-            # so there is nothing to tear down on the device.
-            if is_media_in_use_error(e):
-                raise CoreDeviceError(MEDIA_IN_USE_MESSAGE, code=e.code) from None
-            raise
-        self._svc = svc
         self._transport = transport
+        self._stream_requested = True
+        answer = await svc.start_video_stream(
+            receiver_ip=receiver_ip,
+            receiver_port=transport.port,
+            sender_ip=self._sender_ip,
+            display_id=self._display_id,
+            client_session_id=shared_session_id,
+            allow_rtcp_fb=self._allow_rtcp_fb,
+            ltrp_enabled=self._ltrp_enabled,
+        )
         self._started = True
         cfg = answer["connection"].get("streamConfig", {})
         logger.info(
@@ -971,8 +1064,10 @@ class ScreenMirrorSession:
         if self._audio_enabled:
             try:
                 audio_svc = DisplayService(self._rsd)
+                self._audio_svc = audio_svc
                 await audio_svc.connect()
                 audio_transport, audio_receiver_ip = open_media_receiver(audio_svc, (4 * 1024 * 1024, 1 * 1024 * 1024))
+                self._audio_transport = audio_transport
                 audio_answer = await audio_svc.start_audio_stream(
                     receiver_ip=audio_receiver_ip,
                     receiver_port=audio_transport.port,
@@ -986,8 +1081,6 @@ class ScreenMirrorSession:
                 self._audio_local_ssrc = int(audio_cfg.get("RemoteSSRC", 0))
                 self._audio_remote_ssrc = int(audio_cfg.get("LocalSSRC", 0))
                 self._audio_rtcp_dest = (self._sender_ip, a_source_port) if a_source_port else None
-                self._audio_transport = audio_transport
-                self._audio_svc = audio_svc
                 self._audio_session_id = audio_sid
                 self._audio_decoder = AACELDDecoder()
                 self._audio_player = AudioQueuePlayer()
@@ -1006,18 +1099,26 @@ class ScreenMirrorSession:
                         self._audio_player.close()
                     self._audio_player = None
                 self._audio_decoder = None
-                self._audio_transport = None
-                self._audio_svc = None
+                if self._audio_transport is not None:
+                    with contextlib.suppress(Exception):
+                        self._audio_transport.close()
+                    self._audio_transport = None
+                if self._audio_svc is not None:
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(self._audio_svc.close(), STOP_STEP_TIMEOUT)
+                    self._audio_svc = None
                 self._audio_session_id = None
 
         # 4) Background tasks.
         loop = asyncio.get_running_loop()
         self._loop = loop
         self._feed_task = asyncio.create_task(self._udp_recv_and_pipe(transport))
+        self._feed_task.add_done_callback(self._on_stream_task_done)
         self._refresh_task = asyncio.create_task(self._decoder_refresh_loop())
         # Video RR keepalive -- without this the device reaps the video session
         # after ~25 s (RTCPTimeoutEnabled) and serve-vnc freezes with no recovery.
         self._rtcp_task = asyncio.create_task(self._rtcp_send_loop(transport))
+        self._rtcp_task.add_done_callback(self._on_stream_task_done)
         if self._audio_enabled and self._audio_transport is not None:
             self._audio_recv_task = asyncio.create_task(self._audio_udp_recv(self._audio_transport))
             if self._audio_rtcp_dest and self._audio_local_ssrc and self._audio_remote_ssrc:
@@ -1028,65 +1129,98 @@ class ScreenMirrorSession:
                 )
 
     async def stop(self) -> None:
-        """Tear down everything :meth:`start` created. Idempotent; a no-op before ``start()``."""
-        if not self._started or self._stopped:
+        """Tear down everything :meth:`start` created. Idempotent; a no-op before ``start()``.
+
+        Bounded even when the device is gone and every device call hangs: the HID and stream
+        connections close concurrently within ``STOP_STEP_TIMEOUT``, then releasing the
+        device-side media session gets ``STOP_ALL_STREAMS_TIMEOUT``. Called while :meth:`start`
+        is still in flight, ``stop()`` cancels that ``start()`` (its caller then sees
+        ``asyncio.CancelledError``) and tears down what it had created. Once ``stop()``
+        returns, :meth:`wait_stopped` does too. The session cannot be started again.
+        """
+        if self._stopped:
             return
         self._stopped = True
-        logger.debug("shutdown: stopping HID")
-        await self._stop_hid()
-        logger.debug("shutdown: stopping refresh loop")
-        if self._refresh_task is not None:
-            self._refresh_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._refresh_task
-        if self._rtcp_task is not None:
-            self._rtcp_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._rtcp_task
-        logger.debug("shutdown: stopping VT transcoder")
-        if self._feed_task is not None:
-            self._feed_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._feed_task
+        try:
+            if not self._start_called:
+                return
+            start_task = self._start_task
+            if start_task is not None and start_task is not asyncio.current_task():
+                logger.debug("shutdown: cancelling the in-flight start()")
+                start_task.cancel()
+            await self._teardown(release_device=self._stream_requested, start_exited=self._start_exited)
+        finally:
+            self._stopped_event.set()
+
+    async def _drain_pli_tasks(self) -> None:
         if self._pli_tasks:
-            with contextlib.suppress(Exception):
-                await asyncio.wait(list(self._pli_tasks), timeout=1.0)
+            await asyncio.wait(list(self._pli_tasks), timeout=1.0)
+
+    async def _teardown(self, *, release_device: bool, start_exited: Optional[asyncio.Event] = None) -> None:
+        """Close whatever :meth:`start` created, with every device call bounded (see :meth:`stop`).
+
+        ``start_exited`` is awaited within the same step as the connection closes, so waiting
+        for a cancelled in-flight ``start()`` to unwind costs no extra time."""
+        logger.debug("shutdown: stopping background tasks")
+        tasks = [
+            t
+            for t in (
+                self._refresh_task,
+                self._rtcp_task,
+                self._feed_task,
+                self._audio_recv_task,
+                self._audio_rtcp_task,
+            )
+            if t is not None
+        ]
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        logger.debug("shutdown: stopping VT transcoder")
         if self._transcoder is not None:
             with contextlib.suppress(Exception):
                 self._transcoder.close()
             self._transcoder = None
-        if self._transport is not None:
-            with contextlib.suppress(Exception):
-                self._transport.close()
-        if self._audio_recv_task is not None:
-            logger.debug("shutdown: stopping audio recv loop")
-            self._audio_recv_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._audio_recv_task
-        if self._audio_rtcp_task is not None:
-            logger.debug("shutdown: stopping audio RTCP loop")
-            self._audio_rtcp_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._audio_rtcp_task
         if self._audio_player is not None:
             logger.debug("shutdown: stopping AudioQueue player")
             with contextlib.suppress(Exception):
                 self._audio_player.close()
             self._audio_player = None
-        if self._audio_svc is not None:
-            logger.debug("shutdown: closing audio stream connection")
-            with contextlib.suppress(Exception):
-                await self._audio_svc.close()
-        if self._audio_transport is not None:
-            with contextlib.suppress(Exception):
-                self._audio_transport.close()
-        logger.debug("shutdown: closing device stream connection")
-        if self._svc is not None:
-            with contextlib.suppress(Exception):
-                await self._svc.close()
+
+        # One bounded step: HID, the stream connections, the in-flight PLIs (they still use
+        # the transport) and a cancelled start() all wind down concurrently.
+        logger.debug("shutdown: closing HID and device stream connections")
+        steps: list[Awaitable[Any]] = [self._stop_hid(), self._drain_pli_tasks()]
+        if start_exited is not None:
+            steps.append(start_exited.wait())
+        for svc in (self._audio_svc, self._svc):
+            if svc is not None:
+                steps.append(svc.close())
+        await _await_bounded(
+            asyncio.gather(*steps, return_exceptions=True), STOP_STEP_TIMEOUT, "closing device connections"
+        )
+        self._uhs = None
+        self._indigo = None
+        self._svc = None
+        self._audio_svc = None
+        for task in list(self._pli_tasks):
+            task.cancel()
+        for transport in (self._transport, self._audio_transport):
+            if transport is not None:
+                with contextlib.suppress(Exception):
+                    transport.close()
+        self._transport = None
+        self._audio_transport = None
+
         # Release the device-side session, so the device clears its
         # remote-observation state and frees the camera/microphone (see
         # DisplayService.stop_all_streams).
-        logger.debug("shutdown: releasing device media session")
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(DisplayService.stop_all_streams(self._rsd), timeout=6.0)
+        if release_device:
+            logger.debug("shutdown: releasing device media session")
+            await _await_bounded(
+                DisplayService.stop_all_streams(self._rsd),
+                STOP_ALL_STREAMS_TIMEOUT,
+                "releasing the device media session",
+            )

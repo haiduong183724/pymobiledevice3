@@ -1,31 +1,49 @@
 import asyncio
+import contextlib
+import time
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Optional, cast
 from unittest.mock import Mock
 
 import pytest
 
+from pymobiledevice3.exceptions import CoreDeviceError
 from pymobiledevice3.remote.core_device import screen_mirror
-from pymobiledevice3.remote.core_device.display_service import DisplayService
+from pymobiledevice3.remote.core_device.display_service import (
+    MEDIA_IN_USE_ERROR_CODE,
+    MEDIA_IN_USE_MESSAGE,
+    DisplayService,
+)
 from pymobiledevice3.remote.core_device.hid_service import (
     DIGITIZER_SURFACE_MAIN_TOUCHSCREEN,
     HID_BUTTON_STATE_DOWN,
     TOUCHSCREEN_STATE_CONTACT,
     TOUCHSCREEN_STATE_RELEASE,
 )
-from pymobiledevice3.remote.core_device.screen_mirror import ScreenMirrorSession
+from pymobiledevice3.remote.core_device.screen_mirror import (
+    STOP_ALL_STREAMS_TIMEOUT,
+    STOP_STEP_TIMEOUT,
+    ScreenMirrorSession,
+)
 from pymobiledevice3.remote.core_device.vnc_server import VncStreamServer, _VncClient
 from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
+
+
+async def _hang() -> None:
+    await asyncio.Event().wait()
 
 
 class _FakeTransport:
     port = 0
 
-    def __init__(self) -> None:
+    def __init__(self, recv_error: Optional[BaseException] = None) -> None:
         self.closed = 0
+        self._recv_error = recv_error
 
     async def recv(self) -> bytes:
-        await asyncio.Event().wait()
+        if self._recv_error is not None:
+            raise self._recv_error
+        await _hang()
         raise AssertionError("unreachable")
 
     async def sendto(self, data: bytes, host: str, port: int) -> None:
@@ -41,7 +59,15 @@ class _FakeDevice:
     def __init__(self) -> None:
         self.start_video_stream_calls = 0
         self.stop_all_streams_calls = 0
+        self.close_calls = 0
         self.transports: list[_FakeTransport] = []
+        # Failure injection.
+        self.recv_error: Optional[BaseException] = None
+        self.open_error: Optional[BaseException] = None
+        self.start_error: Optional[BaseException] = None
+        self.hang_start = False
+        self.hang_close = False
+        self.hang_stop_all = False
 
 
 @pytest.fixture
@@ -52,18 +78,28 @@ def device(monkeypatch) -> _FakeDevice:
         pass
 
     async def close(self) -> None:
-        pass
+        fake.close_calls += 1
+        if fake.hang_close:
+            await _hang()
 
     async def start_video_stream(self, **kwargs):
         fake.start_video_stream_calls += 1
+        if fake.hang_start:
+            await _hang()
+        if fake.start_error is not None:
+            raise fake.start_error
         return {"connection": {"streamConfig": {}}}
 
     async def stop_all_streams(cls, rsd):
         fake.stop_all_streams_calls += 1
+        if fake.hang_stop_all:
+            await _hang()
         return {"stopped": True}
 
     def open_media_receiver(svc, rcvbuf_sizes, bind_port=0):
-        transport = _FakeTransport()
+        if fake.open_error is not None:
+            raise fake.open_error
+        transport = _FakeTransport(fake.recv_error)
         fake.transports.append(transport)
         return transport, "127.0.0.1"
 
@@ -202,3 +238,162 @@ async def test_vnc_pointer_sends_release_only_after_press(input_session, rsd):
         (TOUCHSCREEN_STATE_CONTACT, 0, 0),
         (TOUCHSCREEN_STATE_RELEASE, 65535, 65535),
     ]
+
+
+# ----- bounded teardown + failure reporting -----------------------------------
+
+
+@pytest.fixture
+def fast_timeouts(monkeypatch) -> None:
+    monkeypatch.setattr(screen_mirror, "STOP_STEP_TIMEOUT", 0.1)
+    monkeypatch.setattr(screen_mirror, "STOP_ALL_STREAMS_TIMEOUT", 0.1)
+
+
+class _HangingHid:
+    async def close(self) -> None:
+        await _hang()
+
+
+def test_stop_timeouts_bound_stop_under_ten_seconds():
+    assert STOP_STEP_TIMEOUT + STOP_ALL_STREAMS_TIMEOUT < 10
+
+
+async def test_wait_stopped_reports_feed_failure(device, rsd):
+    device.recv_error = OSError("socket closed")
+    session = ScreenMirrorSession(rsd)
+    await session.start()
+    exc = await asyncio.wait_for(session.wait_stopped(), 1)
+    assert isinstance(exc, OSError)
+    await session.stop()
+    assert await asyncio.wait_for(session.wait_stopped(), 1) is exc
+
+
+async def test_wait_stopped_returns_none_after_stop(device, rsd):
+    session = ScreenMirrorSession(rsd)
+    await session.start()
+    await session.stop()
+    assert await asyncio.wait_for(session.wait_stopped(), 1) is None
+
+
+async def test_wait_stopped_blocks_while_streaming(device, rsd):
+    session = ScreenMirrorSession(rsd)
+    await session.start()
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(session.wait_stopped(), 0.05)
+    await session.stop()
+
+
+async def test_rtcp_send_failure_ends_the_task_with_the_error(rsd, monkeypatch):
+    class _BrokenSend(_FakeTransport):
+        async def sendto(self, data: bytes, host: str, port: int) -> None:
+            raise OSError("network down")
+
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(asyncio, "sleep", lambda _delay: real_sleep(0))  # skip the 1 s RR cadence
+    session = ScreenMirrorSession(rsd)
+    session._rtcp_dest = ("::1", 1)
+    session._local_ssrc = session._remote_ssrc = 1
+    with pytest.raises(OSError, match="network down"):
+        await asyncio.wait_for(session._rtcp_send_loop(cast(Any, _BrokenSend())), 1)
+
+
+async def test_stop_is_bounded_when_device_calls_hang(device, rsd, fast_timeouts):
+    device.hang_close = True
+    device.hang_stop_all = True
+    session = ScreenMirrorSession(rsd)
+    await session.start()
+    session._uhs = cast(Any, _HangingHid())
+    session._indigo = cast(Any, _HangingHid())
+    t0 = time.monotonic()
+    await session.stop()
+    assert time.monotonic() - t0 < 10
+    assert device.close_calls == 1
+    assert device.stop_all_streams_calls == 1
+    assert [t.closed for t in device.transports] == [1]
+    assert await asyncio.wait_for(session.wait_stopped(), 1) is None
+
+
+async def test_stop_during_start_does_not_hang(device, rsd, fast_timeouts):
+    device.hang_start = True
+    device.hang_close = True
+    device.hang_stop_all = True
+    session = ScreenMirrorSession(rsd)
+    start = asyncio.create_task(session.start())
+    await asyncio.sleep(0)
+    await asyncio.wait_for(session.stop(), 10)
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await asyncio.wait_for(start, 1)
+    assert start.done()
+    assert start.cancelled()
+    assert [t.closed for t in device.transports] == [1]
+    assert device.close_calls == 1
+
+
+async def test_start_is_single_use(device, rsd):
+    session = ScreenMirrorSession(rsd)
+    await session.start()
+    with pytest.raises(RuntimeError):
+        await session.start()
+    await session.stop()
+    with pytest.raises(RuntimeError):
+        await session.start()
+    assert device.start_video_stream_calls == 1
+
+
+async def test_start_after_stop_raises(device, rsd):
+    session = ScreenMirrorSession(rsd)
+    await session.stop()
+    with pytest.raises(RuntimeError):
+        await session.start()
+
+
+async def test_failed_start_closes_what_it_created(device, rsd):
+    device.start_error = OSError("tunnel gone")
+    session = ScreenMirrorSession(rsd)
+    with pytest.raises(OSError, match="tunnel gone"):
+        await session.start()
+    assert [t.closed for t in device.transports] == [1]
+    assert device.close_calls == 1
+    assert device.stop_all_streams_calls == 0  # no stream came up: nothing to release
+    assert await asyncio.wait_for(session.wait_stopped(), 1) is None
+    await session.stop()  # no-op after a failed start
+    assert device.close_calls == 1
+
+
+async def test_failed_receiver_open_closes_the_service(device, rsd):
+    device.open_error = OSError("no socket")
+    session = ScreenMirrorSession(rsd)
+    with pytest.raises(OSError, match="no socket"):
+        await session.start()
+    assert device.close_calls == 1
+
+
+async def test_media_in_use_is_still_reported_cleanly(device, rsd):
+    device.start_error = CoreDeviceError("busy", code=MEDIA_IN_USE_ERROR_CODE)
+    session = ScreenMirrorSession(rsd)
+    with pytest.raises(CoreDeviceError) as info:
+        await session.start()
+    assert str(info.value) == MEDIA_IN_USE_MESSAGE
+    assert [t.closed for t in device.transports] == [1]
+    assert device.close_calls == 1
+
+
+async def test_stop_is_bounded_when_a_device_call_ignores_cancellation(device, rsd, fast_timeouts, monkeypatch):
+    release = asyncio.Event()
+
+    async def stubborn_close(self) -> None:
+        device.close_calls += 1
+        while not release.is_set():
+            with contextlib.suppress(asyncio.CancelledError):
+                await release.wait()
+
+    monkeypatch.setattr(DisplayService, "close", stubborn_close)
+    session = ScreenMirrorSession(rsd)
+    await session.start()
+    try:
+        await asyncio.wait_for(session.stop(), 2)
+        assert [t.closed for t in device.transports] == [1]
+        assert device.stop_all_streams_calls == 1
+    finally:
+        release.set()
+        await asyncio.sleep(0)
