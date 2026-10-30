@@ -202,7 +202,7 @@ async def main(udid: str):
             await s.send_touch(100, 200, contact=False)
             await s.send_button("home", down=True)
             await s.send_button("home", down=False)
-            error = await s.wait_stopped()  # blocks until the stream ends; None after stop()
+            error = await s.wait_stopped()  # blocks until the stream fails (e.g. device unplugged) and returns that exception
 ```
 
 ## 4. Finding the right service
