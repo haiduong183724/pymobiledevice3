@@ -171,6 +171,40 @@ async with DvtProvider(rsd) as dvt:
     print("launched pid", pid)
 ```
 
+### Mirror the screen
+
+`ScreenMirrorSession` streams the device screen as decoded frames. It needs the CoreDevice display and
+HID services, which exist only while the Developer Disk Image is mounted, so mount it once per device
+boot. `on_frame` runs on the event-loop thread and receives each frame as BGRA bytes plus its width and
+height.
+
+```python
+from pymobiledevice3.exceptions import AlreadyMountedError
+from pymobiledevice3.remote.core_device.screen_mirror import ScreenMirrorSession
+from pymobiledevice3.remote.userspace_tunnel import UserspaceRsdTunnel
+from pymobiledevice3.services.mobile_image_mounter import auto_mount_personalized
+
+
+def on_frame(bgra: bytes, width: int, height: int) -> None:
+    ...  # runs on the event-loop thread: keep it quick, or hand the bytes off
+
+
+async def main(udid: str):
+    async with UserspaceRsdTunnel(serial=udid) as rsd:
+        try:
+            await auto_mount_personalized(rsd)
+        except AlreadyMountedError:
+            pass  # already mounted since this boot
+
+        async with ScreenMirrorSession(rsd, on_frame=on_frame) as s:
+            await s.wait_first_frame()
+            await s.send_touch(100, 200, contact=True)  # decoded-frame pixels
+            await s.send_touch(100, 200, contact=False)
+            await s.send_button("home", down=True)
+            await s.send_button("home", down=False)
+            error = await s.wait_stopped()  # blocks until the stream ends; None after stop()
+```
+
 ## 4. Finding the right service
 
 There are ~30 services under `pymobiledevice3/services/`. A few common ones:
