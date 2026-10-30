@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import sys
 import time
 from types import SimpleNamespace
 from typing import Any, ClassVar, Optional, cast
@@ -7,7 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from pymobiledevice3.exceptions import CoreDeviceError
+from pymobiledevice3.exceptions import CoreDeviceError, ScreenMirrorStopped
 from pymobiledevice3.remote.core_device import screen_mirror
 from pymobiledevice3.remote.core_device.display_service import (
     MEDIA_IN_USE_ERROR_CODE,
@@ -396,12 +397,80 @@ async def test_stop_during_start_does_not_hang(device, rsd, fast_timeouts):
     start = asyncio.create_task(session.start())
     await asyncio.sleep(0)
     await asyncio.wait_for(session.stop(), 10)
-    with contextlib.suppress(asyncio.CancelledError, Exception):
+    with contextlib.suppress(ScreenMirrorStopped):
         await asyncio.wait_for(start, 1)
     assert start.done()
-    assert start.cancelled()
+    assert not start.cancelled()
+    assert isinstance(start.exception(), ScreenMirrorStopped)
     assert [t.closed for t in device.transports] == [1]
     assert device.close_calls == 1
+
+
+async def test_stop_during_start_raises_screen_mirror_stopped_and_leaves_the_caller_running(device, rsd):
+    device.hang_start = True
+    session = ScreenMirrorSession(rsd)
+
+    async def embedder() -> str:
+        with pytest.raises(ScreenMirrorStopped):
+            await session.start()
+        if sys.version_info >= (3, 11):
+            task = asyncio.current_task()
+            assert task is not None and task.cancelling() == 0
+        await asyncio.sleep(0.01)  # the caller's own task is not cancelled: it keeps running
+        return "kept running"
+
+    runner = asyncio.create_task(embedder())
+    while device.start_video_stream_calls == 0:
+        await asyncio.sleep(0)
+    await asyncio.wait_for(session.stop(), 2)
+    assert await asyncio.wait_for(runner, 1) == "kept running"
+    assert [t.closed for t in device.transports] == [1]
+
+
+async def test_external_cancel_of_start_propagates_cancelled_error(device, rsd):
+    device.hang_start = True
+    session = ScreenMirrorSession(rsd)
+    start = asyncio.create_task(session.start())
+    while device.start_video_stream_calls == 0:
+        await asyncio.sleep(0)
+    start.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(start, 2)
+    assert [t.closed for t in device.transports] == [1]
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="needs Task.cancelling() to tell the two apart")
+async def test_external_cancel_racing_stop_still_propagates_cancelled_error(device, rsd):
+    device.hang_start = True
+    session = ScreenMirrorSession(rsd)
+    start = asyncio.create_task(session.start())
+    while device.start_video_stream_calls == 0:
+        await asyncio.sleep(0)
+    start.cancel()
+    await asyncio.wait_for(session.stop(), 2)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(start, 1)
+
+
+async def test_stop_during_start_whose_device_call_swallows_cancellation_starts_no_tasks(device, rsd, monkeypatch):
+    calls = []
+
+    async def stubborn_start_video_stream(self, **kwargs):
+        calls.append(kwargs)
+        with contextlib.suppress(asyncio.CancelledError):
+            await _hang()
+        return {"connection": {"streamConfig": {}}}
+
+    monkeypatch.setattr(DisplayService, "start_video_stream", stubborn_start_video_stream)
+    session = ScreenMirrorSession(rsd)
+    start = asyncio.create_task(session.start())
+    while not calls:
+        await asyncio.sleep(0)
+    await asyncio.wait_for(session.stop(), 2)
+    with pytest.raises(ScreenMirrorStopped):
+        await asyncio.wait_for(start, 1)
+    assert session._feed_task is None and session._refresh_task is None and session._rtcp_task is None
+    assert [t.closed for t in device.transports] == [1]
 
 
 async def test_start_is_single_use(device, rsd):

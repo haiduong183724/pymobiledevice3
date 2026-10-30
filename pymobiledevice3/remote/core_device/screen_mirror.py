@@ -24,7 +24,7 @@ from collections.abc import Awaitable
 from types import TracebackType
 from typing import Any, Callable, Optional
 
-from pymobiledevice3.exceptions import CoreDeviceError
+from pymobiledevice3.exceptions import CoreDeviceError, ScreenMirrorStopped
 from pymobiledevice3.remote.core_device.aac_eld import AACELDDecoder
 from pymobiledevice3.remote.core_device.audio_player import AudioQueuePlayer
 from pymobiledevice3.remote.core_device.display_service import (
@@ -261,6 +261,9 @@ class ScreenMirrorSession:
         self._start_exited = asyncio.Event()
         self._start_exited.set()
         self._start_task: Optional[asyncio.Task[Any]] = None
+        # Set by ``stop()`` when it cancels the in-flight ``start()``, so ``start()`` can raise
+        # ScreenMirrorStopped for that cancellation (and only that one).
+        self._cancelled_by_stop = False
         # ``wait_stopped()``: set by ``stop()`` (or a failed ``start()``) and by the first
         # failure of the video feed / RTCP task, which ``_failure`` then records.
         self._stopped_event = asyncio.Event()
@@ -998,9 +1001,11 @@ class ScreenMirrorSession:
 
         The session is single-use: calling ``start()`` again, or after :meth:`stop`, raises
         ``RuntimeError``. If ``start()`` fails, everything it created is closed before the
-        exception propagates, so no :meth:`stop` is needed. A concurrent :meth:`stop` cancels an
-        in-flight ``start()`` (a hung device call can never notice a flag): ``start()`` unwinds
-        and ``asyncio.CancelledError`` propagates to its caller.
+        exception propagates, so no :meth:`stop` is needed. A concurrent :meth:`stop` interrupts
+        an in-flight ``start()`` (it cancels the device call, since a hung one can never notice a
+        flag): ``start()`` unwinds and raises :class:`~pymobiledevice3.exceptions.ScreenMirrorStopped`,
+        and the caller's task is not left cancelled. Cancelling the caller's task itself still
+        propagates ``asyncio.CancelledError``.
         """
         if self._start_called or self._stopped:
             raise RuntimeError("ScreenMirrorSession is single-use: start() was already called or the session stopped")
@@ -1020,6 +1025,14 @@ class ScreenMirrorSession:
                 finally:
                     self._teardown_done.set()
                     self._stopped_event.set()
+            if self._cancelled_by_stop:
+                # stop() cancelled us (whatever the interrupted device call turned that into).
+                if self._withdraw_stop_cancellation():
+                    raise ScreenMirrorStopped("stop() interrupted start()") from None
+                # The caller's task was cancelled as well: that cancellation wins.
+                if not isinstance(e, asyncio.CancelledError):
+                    raise asyncio.CancelledError() from e
+                raise
             if isinstance(e, CoreDeviceError) and is_media_in_use_error(e):
                 # Camera/microphone in use: there is nothing to serve. Fail fast
                 # with a clean, actionable error (no traceback).
@@ -1028,6 +1041,19 @@ class ScreenMirrorSession:
         finally:
             self._start_task = None
             self._start_exited.set()
+
+    def _withdraw_stop_cancellation(self) -> bool:
+        """Undo the ``cancel()`` that :meth:`stop` sent the task running :meth:`start`.
+
+        Returns ``True`` when no other cancellation of that task is pending, i.e. the
+        cancellation came from ``stop()`` alone and may be reported as ScreenMirrorStopped.
+        Before Python 3.11 a task keeps no cancellation count, so the flag alone decides."""
+        self._cancelled_by_stop = False
+        if sys.version_info >= (3, 11):
+            task = asyncio.current_task()
+            if task is not None:
+                return task.uncancel() == 0
+        return True
 
     async def _start_streams(self) -> None:
         """The body of :meth:`start`. Everything it creates goes on ``self`` as soon as it
@@ -1142,7 +1168,10 @@ class ScreenMirrorSession:
                     self._audio_svc = None
                 self._audio_session_id = None
 
-        # 4) Background tasks.
+        # 4) Background tasks. A device call above may have swallowed stop()'s cancellation:
+        # bail out rather than start tasks that the (already running) teardown would miss.
+        if self._stopped:
+            raise ScreenMirrorStopped("stop() interrupted start()")
         loop = asyncio.get_running_loop()
         self._loop = loop
         self._feed_task = asyncio.create_task(self._udp_recv_and_pipe(transport))
@@ -1167,8 +1196,9 @@ class ScreenMirrorSession:
         Bounded even when the device is gone and every device call hangs: the HID and stream
         connections close concurrently within ``STOP_STEP_TIMEOUT``, then releasing the
         device-side media session gets ``STOP_ALL_STREAMS_TIMEOUT``. Called while :meth:`start`
-        is still in flight, ``stop()`` cancels that ``start()`` (its caller then sees
-        ``asyncio.CancelledError``) and tears down what it had created. There is one teardown,
+        is still in flight, ``stop()`` interrupts that ``start()`` (which then raises
+        :class:`~pymobiledevice3.exceptions.ScreenMirrorStopped`) and tears down what it had
+        created. There is one teardown,
         whoever runs it (the first ``stop()`` or a failed ``start()``): every ``stop()`` call
         returns only once it has finished. Once ``stop()`` returns, :meth:`wait_stopped` does
         too. The session cannot be started again.
@@ -1183,6 +1213,7 @@ class ScreenMirrorSession:
             start_task = self._start_task
             if start_task is not None and start_task is not asyncio.current_task():
                 logger.debug("shutdown: cancelling the in-flight start()")
+                self._cancelled_by_stop = True
                 start_task.cancel()
             await self._teardown(release_device=self._stream_requested, start_exited=self._start_exited)
         finally:
