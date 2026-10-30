@@ -121,7 +121,7 @@ def _is_key_nal(nt: int) -> bool:
 
 # Named iOS hardware buttons → (usage_page, usage_code). Same table as
 # ``cli/developer/core_device.py``; replicated rather than imported so
-# this server module stays decoupled from the CLI layer.
+# this module stays decoupled from the CLI layer.
 _BTN_HOME = (0x0C, 0x40)
 _BTN_LOCK = (0x0C, 0x30)
 _BTN_VOL_UP = (0x0C, 0xE9)

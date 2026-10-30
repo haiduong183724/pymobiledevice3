@@ -178,6 +178,13 @@ HID services, which exist only while the Developer Disk Image is mounted, so mou
 boot. `on_frame` runs on the event-loop thread and receives each frame as BGRA bytes plus its width and
 height.
 
+Call `send_touch`, `send_button` and `stop()` on the event loop that runs the session (from another
+thread, such as a GUI thread, submit them with `asyncio.run_coroutine_threadsafe`), and construct the
+session on that loop's thread: on Python 3.9 asyncio primitives bind to the loop at construction. If
+`stop()` interrupts a `start()` that is still in flight, `start()` raises
+`pymobiledevice3.exceptions.ScreenMirrorStopped`; cancelling the task running `start()` still raises
+`asyncio.CancelledError`.
+
 ```python
 from pymobiledevice3.exceptions import AlreadyMountedError
 from pymobiledevice3.remote.core_device.screen_mirror import ScreenMirrorSession
