@@ -38,7 +38,6 @@ from cryptography.hazmat.primitives.ciphers import Cipher, modes
 from pymobiledevice3.remote.core_device import rfb_clipboard
 from pymobiledevice3.remote.core_device.hid_service import (
     ASCII_TO_HID,
-    DIGITIZER_SURFACE_MAIN_TOUCHSCREEN,
     KEY_BACKSPACE,
     KEY_CAPS_LOCK,
     KEY_DOWN,
@@ -57,8 +56,6 @@ from pymobiledevice3.remote.core_device.hid_service import (
     KEY_RIGHT_SHIFT,
     KEY_TAB,
     KEY_UP,
-    TOUCHSCREEN_STATE_CONTACT,
-    TOUCHSCREEN_STATE_RELEASE,
 )
 from pymobiledevice3.remote.core_device.pasteboard_service import PasteboardContent, PasteboardMonitor
 from pymobiledevice3.remote.core_device.screen_mirror import (
@@ -291,30 +288,11 @@ class VncStreamServer(ScreenMirrorSession):
                 await self._send_hid_button(page, code, down=bool(button_mask & mask))
         client.last_button_mask = button_mask
 
-        hid_x = max(0, min(65535, int(x * 65535 / max(1, self._fb_width - 1))))
-        hid_y = max(0, min(65535, int(y * 65535 / max(1, self._fb_height - 1))))
+        hid_x, hid_y = self._to_hid_coords(x, y)
         pressed = bool(button_mask & 1)
-        try:
-            await self._ensure_hid()
-            assert self._uhs is not None
-            if pressed:
-                await self._uhs.send_touchscreen(
-                    TOUCHSCREEN_STATE_CONTACT,
-                    hid_x,
-                    hid_y,
-                    service_id=DIGITIZER_SURFACE_MAIN_TOUCHSCREEN,
-                )
-            elif client.pressed:
-                # Transition pressed -> released: send release at the
-                # last drag position.
-                await self._uhs.send_touchscreen(
-                    TOUCHSCREEN_STATE_RELEASE,
-                    hid_x,
-                    hid_y,
-                    service_id=DIGITIZER_SURFACE_MAIN_TOUCHSCREEN,
-                )
-        except Exception:
-            logger.exception("HID send failed")
+        # Release only on the pressed -> released transition, at the last drag position.
+        if pressed or client.pressed:
+            await self.send_touch(x, y, contact=pressed)
         client.pressed = pressed
         client.last_x = hid_x
         client.last_y = hid_y

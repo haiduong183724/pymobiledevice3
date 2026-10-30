@@ -7,6 +7,12 @@ import pytest
 
 from pymobiledevice3.remote.core_device import screen_mirror
 from pymobiledevice3.remote.core_device.display_service import DisplayService
+from pymobiledevice3.remote.core_device.hid_service import (
+    DIGITIZER_SURFACE_MAIN_TOUCHSCREEN,
+    HID_BUTTON_STATE_DOWN,
+    TOUCHSCREEN_STATE_CONTACT,
+    TOUCHSCREEN_STATE_RELEASE,
+)
 from pymobiledevice3.remote.core_device.screen_mirror import ScreenMirrorSession
 from pymobiledevice3.remote.core_device.vnc_server import VncStreamServer, _VncClient
 from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
@@ -126,3 +132,73 @@ async def test_vnc_server_wakes_its_clients_on_a_frame(device, rsd):
     assert client.wants_update.is_set()
     assert server.frame_size == (4, 2)
     assert server._consumer_count() == 1
+
+
+class _FakeUhs:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int, int]] = []
+
+    async def send_touchscreen(self, state, x, y, *, service_id=None) -> None:
+        assert service_id == DIGITIZER_SURFACE_MAIN_TOUCHSCREEN
+        self.calls.append((state, x, y))
+
+
+class _FakeIndigo:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int, int]] = []
+
+    async def send_button(self, page, code, state) -> None:
+        self.calls.append((page, code, state))
+
+
+@pytest.fixture
+def input_session(rsd) -> ScreenMirrorSession:
+    session = ScreenMirrorSession(rsd)
+    session._fb_width, session._fb_height = 100, 200
+    session._uhs = cast(Any, _FakeUhs())
+    session._indigo = cast(Any, _FakeIndigo())
+    return session
+
+
+async def test_touch_scales_frame_pixels_to_hid_range(input_session):
+    fake = cast(Any, input_session._uhs)
+    await input_session.send_touch(0, 0, contact=True)
+    await input_session.send_touch(99, 199, contact=False)
+    assert fake.calls == [(TOUCHSCREEN_STATE_CONTACT, 0, 0), (TOUCHSCREEN_STATE_RELEASE, 65535, 65535)]
+
+
+async def test_touch_clamps_out_of_frame_coordinates(input_session):
+    await input_session.send_touch(-5, 500, contact=True)
+    assert cast(Any, input_session._uhs).calls == [(TOUCHSCREEN_STATE_CONTACT, 0, 65535)]
+
+
+async def test_touch_before_first_frame_is_ignored(input_session):
+    input_session._fb_width = input_session._fb_height = 0
+    await input_session.send_touch(10, 10, contact=True)
+    assert cast(Any, input_session._uhs).calls == []
+
+
+async def test_send_button_uses_named_usage(input_session):
+    await input_session.send_button("home", down=True)
+    assert cast(Any, input_session._indigo).calls == [(0x0C, 0x40, HID_BUTTON_STATE_DOWN)]
+
+
+async def test_send_button_unknown_name_raises(input_session):
+    with pytest.raises(KeyError):
+        await input_session.send_button("nope", down=True)
+
+
+async def test_vnc_pointer_sends_release_only_after_press(input_session, rsd):
+    server = VncStreamServer(rsd)
+    server._fb_width, server._fb_height = 100, 200
+    server._uhs = input_session._uhs
+    client = _VncClient.__new__(_VncClient)
+    client.last_button_mask = 0
+    client.pressed = False
+    await server._handle_pointer(client, 0, 10, 10)
+    await server._handle_pointer(client, 1, 0, 0)
+    await server._handle_pointer(client, 0, 99, 199)
+    assert cast(Any, server._uhs).calls == [
+        (TOUCHSCREEN_STATE_CONTACT, 0, 0),
+        (TOUCHSCREEN_STATE_RELEASE, 65535, 65535),
+    ]

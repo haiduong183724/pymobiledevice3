@@ -33,8 +33,11 @@ from pymobiledevice3.remote.core_device.display_service import (
 )
 from pymobiledevice3.remote.core_device.hevc_rps import HevcRpsTracker, is_slice_nal
 from pymobiledevice3.remote.core_device.hid_service import (
+    DIGITIZER_SURFACE_MAIN_TOUCHSCREEN,
     HID_BUTTON_STATE_DOWN,
     HID_BUTTON_STATE_UP,
+    TOUCHSCREEN_STATE_CONTACT,
+    TOUCHSCREEN_STATE_RELEASE,
     IndigoHIDService,
     UniversalHIDServiceService,
 )
@@ -93,6 +96,16 @@ _BTN_VOL_UP = (0x0C, 0xE9)
 _BTN_VOL_DOWN = (0x0C, 0xEA)
 _BTN_MUTE = (0x0C, 0xE2)
 _BTN_SIRI = (0x0C, 0xCF)
+
+# Public name -> (usage_page, usage_code) table for :meth:`ScreenMirrorSession.send_button`.
+HARDWARE_BUTTONS: dict[str, tuple[int, int]] = {
+    "home": _BTN_HOME,
+    "lock": _BTN_LOCK,
+    "volume-up": _BTN_VOL_UP,
+    "volume-down": _BTN_VOL_DOWN,
+    "mute": _BTN_MUTE,
+    "siri": _BTN_SIRI,
+}
 
 
 class ScreenMirrorSession:
@@ -805,6 +818,36 @@ class ScreenMirrorSession:
                 return
 
     # ----- HID --------------------------------------------------------------
+    def _to_hid_coords(self, x: int, y: int) -> tuple[int, int]:
+        """Clamp frame-pixel ``(x, y)`` and rescale it to the device's 0..65535 range."""
+        hid_x = max(0, min(65535, int(x * 65535 / max(1, self._fb_width - 1))))
+        hid_y = max(0, min(65535, int(y * 65535 / max(1, self._fb_height - 1))))
+        return hid_x, hid_y
+
+    async def send_touch(self, x: int, y: int, *, contact: bool) -> None:
+        """Send a touchscreen contact (``contact=True``) or release at ``(x, y)`` in decoded-frame pixels.
+
+        Out-of-frame coordinates are clamped. Ignored until the first frame is decoded."""
+        if self._fb_width <= 0 or self._fb_height <= 0:
+            return
+        hid_x, hid_y = self._to_hid_coords(x, y)
+        try:
+            await self._ensure_hid()
+            assert self._uhs is not None
+            await self._uhs.send_touchscreen(
+                TOUCHSCREEN_STATE_CONTACT if contact else TOUCHSCREEN_STATE_RELEASE,
+                hid_x,
+                hid_y,
+                service_id=DIGITIZER_SURFACE_MAIN_TOUCHSCREEN,
+            )
+        except Exception:
+            logger.exception("HID send failed")
+
+    async def send_button(self, name: str, *, down: bool) -> None:
+        """Press (``down=True``) or release a button from :data:`HARDWARE_BUTTONS`; ``KeyError`` if unknown."""
+        page, code = HARDWARE_BUTTONS[name]
+        await self._send_hid_button(page, code, down=down)
+
     async def _ensure_hid(self) -> None:
         async with self._hid_lock:
             if self._uhs is None:
