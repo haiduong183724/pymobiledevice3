@@ -901,14 +901,17 @@ class ScreenMirrorSession:
     async def send_touch(self, x: int, y: int, *, contact: bool) -> None:
         """Send a touchscreen contact (``contact=True``) or release at ``(x, y)`` in decoded-frame pixels.
 
-        Out-of-frame coordinates are clamped. Ignored until the first frame is decoded."""
-        if self._fb_width <= 0 or self._fb_height <= 0:
+        Out-of-frame coordinates are clamped. Ignored until the first frame is decoded, and
+        outside a running session (before :meth:`start` brings the stream up, or after
+        :meth:`stop`)."""
+        if not self._accepting_input() or self._fb_width <= 0 or self._fb_height <= 0:
             return
         hid_x, hid_y = self._to_hid_coords(x, y)
         try:
-            await self._ensure_hid()
-            assert self._uhs is not None
-            await self._uhs.send_touchscreen(
+            uhs = await self._ensure_hid()
+            if uhs is None:
+                return
+            await uhs.send_touchscreen(
                 TOUCHSCREEN_STATE_CONTACT if contact else TOUCHSCREEN_STATE_RELEASE,
                 hid_x,
                 hid_y,
@@ -918,23 +921,41 @@ class ScreenMirrorSession:
             logger.exception("HID send failed")
 
     async def send_button(self, name: str, *, down: bool) -> None:
-        """Press (``down=True``) or release a button from :data:`HARDWARE_BUTTONS`; ``KeyError`` if unknown."""
+        """Press (``down=True``) or release a button from :data:`HARDWARE_BUTTONS`; ``KeyError`` if unknown.
+
+        Ignored outside a running session (before :meth:`start` brings the stream up, or after
+        :meth:`stop`)."""
         page, code = HARDWARE_BUTTONS[name]
         await self._send_hid_button(page, code, down=down)
 
-    async def _ensure_hid(self) -> None:
+    def _accepting_input(self) -> bool:
+        """Input reaches the device only while the stream is up and ``stop()`` has not begun."""
+        return self._started and not self._stopped
+
+    async def _ensure_hid(self) -> Optional[UniversalHIDServiceService]:
+        """The touchscreen/keyboard HID connection, opened on first use; ``None`` outside a running session."""
         async with self._hid_lock:
-            if self._uhs is None:
+            if self._uhs is None and self._accepting_input():
                 uhs = UniversalHIDServiceService(self._rsd)
                 await uhs.connect()
+                if self._stopped:
+                    # stop() ran while we connected and its teardown already closed HID.
+                    await _await_bounded(uhs.close(), STOP_STEP_TIMEOUT, "closing a late HID connection")
+                    return None
                 self._uhs = uhs
+            return self._uhs
 
-    async def _ensure_indigo(self) -> None:
+    async def _ensure_indigo(self) -> Optional[IndigoHIDService]:
+        """The hardware-button HID connection, opened on first use; ``None`` outside a running session."""
         async with self._hid_lock:
-            if self._indigo is None:
+            if self._indigo is None and self._accepting_input():
                 ihs = IndigoHIDService(self._rsd)
                 await ihs.connect()
+                if self._stopped:
+                    await _await_bounded(ihs.close(), STOP_STEP_TIMEOUT, "closing a late HID connection")
+                    return None
                 self._indigo = ihs
+            return self._indigo
 
     async def _stop_hid(self) -> None:
         if self._uhs is not None:
@@ -946,20 +967,26 @@ class ScreenMirrorSession:
                 await self._indigo.close()
             self._indigo = None
 
-    async def _ensure_keyboard(self) -> None:
-        await self._ensure_hid()
+    async def _ensure_keyboard(self) -> bool:
+        """Register the virtual keyboard on first use; ``False`` outside a running session."""
+        uhs = await self._ensure_hid()
+        if uhs is None:
+            return False
         if self._kb_service_id is None:
             async with self._hid_lock:
                 if self._kb_service_id is None:
-                    assert self._uhs is not None
-                    self._kb_service_id = await self._uhs.create_keyboard_service()
+                    self._kb_service_id = await uhs.create_keyboard_service()
+        return True
 
     async def _send_hid_button(self, page: int, code: int, *, down: bool) -> None:
+        if not self._accepting_input():
+            return
         state = HID_BUTTON_STATE_DOWN if down else HID_BUTTON_STATE_UP
         try:
-            await self._ensure_indigo()
-            assert self._indigo is not None
-            await self._indigo.send_button(page, code, state)
+            indigo = await self._ensure_indigo()
+            if indigo is None:
+                return
+            await indigo.send_button(page, code, state)
         except Exception:
             logger.exception("HID button send failed (page=0x%02X code=0x%02X)", page, code)
 

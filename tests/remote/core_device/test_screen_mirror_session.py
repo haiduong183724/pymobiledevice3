@@ -2,7 +2,7 @@ import asyncio
 import contextlib
 import time
 from types import SimpleNamespace
-from typing import Any, Optional, cast
+from typing import Any, ClassVar, Optional, cast
 from unittest.mock import Mock
 
 import pytest
@@ -190,6 +190,7 @@ class _FakeIndigo:
 @pytest.fixture
 def input_session(rsd) -> ScreenMirrorSession:
     session = ScreenMirrorSession(rsd)
+    session._started = True  # input is accepted only while the session is running
     session._fb_width, session._fb_height = 100, 200
     session._uhs = cast(Any, _FakeUhs())
     session._indigo = cast(Any, _FakeIndigo())
@@ -226,6 +227,7 @@ async def test_send_button_unknown_name_raises(input_session):
 
 async def test_vnc_pointer_sends_release_only_after_press(input_session, rsd):
     server = VncStreamServer(rsd)
+    server._started = True
     server._fb_width, server._fb_height = 100, 200
     server._uhs = input_session._uhs
     client = _VncClient.__new__(_VncClient)
@@ -238,6 +240,79 @@ async def test_vnc_pointer_sends_release_only_after_press(input_session, rsd):
         (TOUCHSCREEN_STATE_CONTACT, 0, 0),
         (TOUCHSCREEN_STATE_RELEASE, 65535, 65535),
     ]
+
+
+class _FakeHidConnection:
+    """Stands in for UniversalHIDServiceService / IndigoHIDService; records connects and closes."""
+
+    instances: ClassVar[list["_FakeHidConnection"]] = []
+    connect_gate: ClassVar[Optional[asyncio.Event]] = None
+
+    def __init__(self, rsd) -> None:
+        self.connected = False
+        self.closed = False
+        self.calls: list[tuple[Any, ...]] = []
+        _FakeHidConnection.instances.append(self)
+
+    async def connect(self) -> None:
+        if _FakeHidConnection.connect_gate is not None:
+            await _FakeHidConnection.connect_gate.wait()
+        self.connected = True
+
+    async def close(self) -> None:
+        self.closed = True
+
+    async def send_touchscreen(self, *args, **kwargs) -> None:
+        self.calls.append(args)
+
+    async def send_button(self, *args) -> None:
+        self.calls.append(args)
+
+
+@pytest.fixture
+def hid_connections(monkeypatch) -> list[_FakeHidConnection]:
+    _FakeHidConnection.instances = []
+    _FakeHidConnection.connect_gate = None
+    monkeypatch.setattr(screen_mirror, "UniversalHIDServiceService", _FakeHidConnection)
+    monkeypatch.setattr(screen_mirror, "IndigoHIDService", _FakeHidConnection)
+    return _FakeHidConnection.instances
+
+
+async def test_input_after_stop_opens_no_hid_connection(device, rsd, hid_connections):
+    session = ScreenMirrorSession(rsd)
+    await session.start()
+    session._fb_width, session._fb_height = 100, 200
+    await session.stop()
+    await session.send_touch(10, 10, contact=True)
+    await session.send_button("home", down=True)
+    assert hid_connections == []
+
+
+async def test_send_button_before_start_opens_no_hid_connection(device, rsd, hid_connections):
+    session = ScreenMirrorSession(rsd)
+    await session.send_button("home", down=True)
+    session._fb_width, session._fb_height = 100, 200
+    await session.send_touch(10, 10, contact=True)
+    assert hid_connections == []
+
+
+@pytest.mark.parametrize("send", ["touch", "button"])
+async def test_hid_connect_completing_after_stop_is_closed(device, rsd, hid_connections, send):
+    session = ScreenMirrorSession(rsd)
+    await session.start()
+    session._fb_width, session._fb_height = 100, 200
+    gate = _FakeHidConnection.connect_gate = asyncio.Event()
+    if send == "touch":
+        sending = asyncio.create_task(session.send_touch(10, 10, contact=True))
+    else:
+        sending = asyncio.create_task(session.send_button("home", down=True))
+    while not hid_connections:
+        await asyncio.sleep(0)
+    await session.stop()
+    gate.set()  # the connect finishes only after the teardown
+    await asyncio.wait_for(sending, 1)
+    assert [(c.connected, c.closed, c.calls) for c in hid_connections] == [(True, True, [])]
+    assert session._uhs is None and session._indigo is None
 
 
 # ----- bounded teardown + failure reporting -----------------------------------

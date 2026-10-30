@@ -366,7 +366,8 @@ class VncStreamServer(ScreenMirrorSession):
             for u in client.active_typing.pop(keysym, usages):
                 client.pressed_keys.discard(u)
         try:
-            await self._ensure_keyboard()
+            if not await self._ensure_keyboard():
+                return  # the session is not running
             assert self._uhs is not None and self._kb_service_id is not None
             await self._uhs.send_keyboard(self._kb_service_id, client.pressed_keys)
         except Exception:
