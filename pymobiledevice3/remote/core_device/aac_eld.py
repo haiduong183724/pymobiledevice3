@@ -2,8 +2,8 @@
 AAC-ELD -> s16le 48 kHz stereo PCM decoder via macOS AudioToolbox.
 
 Used by both the browser screen-stream path (screen_stream.py, which
-forwards PCM to /audio.bin subscribers) and the VNC path
-(vnc_server.py, which feeds PCM to an AudioQueue for local playback).
+forwards PCM to /audio.bin subscribers) and the screen-mirror path
+(screen_mirror.py, which feeds PCM to an AudioQueue for local playback).
 
 Why not pyav / ffmpeg's aac_at wrapper? Both go through the same
 AudioToolbox under the hood, but the wrappers don't surface

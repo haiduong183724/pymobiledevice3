@@ -66,6 +66,7 @@ __all__ = [
     "RemoteAutomationNotEnabledError",
     "RemotePairingCompletedError",
     "RemoteXPCHandshakeTimeoutError",
+    "ScreenMirrorStopped",
     "ScreencastUnavailableError",
     "SessionActiveError",
     "SetProhibitedError",
@@ -529,6 +530,16 @@ class CoreDeviceError(PyMobileDevice3Exception):
         super().__init__(message)
         self.code = code
         self.user_info = user_info or {}
+
+
+class ScreenMirrorStopped(PyMobileDevice3Exception):
+    """``ScreenMirrorSession.stop()`` ended a ``start()`` that was still in flight.
+
+    Raised by ``start()`` instead of ``asyncio.CancelledError``, so the caller can tell its
+    own session being stopped apart from its task being cancelled.
+    """
+
+    pass
 
 
 class CryptexdError(PyMobileDevice3Exception):

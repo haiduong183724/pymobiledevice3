@@ -1,8 +1,8 @@
 """
 CoreAudio AudioQueue PCM playback (macOS only, pure ctypes).
 
-Used by :mod:`vnc_server` to play AAC-ELD-decoded PCM through the host
-Mac's speakers while the user views the device screen via VNC. RFB has
+Used by :mod:`screen_mirror` to play AAC-ELD-decoded PCM through the host
+Mac's speakers while the user views the device screen (e.g. via VNC). RFB has
 no audio of its own; the host-local playback is the same pattern macOS
 Screen Sharing.app uses for audio over its own private encodings.
 

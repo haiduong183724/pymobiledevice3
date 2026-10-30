@@ -63,7 +63,7 @@ class HevcToBgraTranscoder:
     ``on_frame(bgra)`` fires on the worker thread for each successfully
     decoded frame. ``on_decode_error()`` fires when libav raises or
     produces no output for an AU -- the sticky-keyframe recovery path
-    in ``vnc_server`` arms PLI off this signal.
+    in ``screen_mirror`` arms PLI off this signal.
     """
 
     def __init__(
