@@ -11,6 +11,7 @@ from typing import Annotated, Callable, ClassVar, Optional, Union
 from pycrashreport.crash_report import CrashReportBase, get_crash_report_from_buf
 
 from pymobiledevice3.exceptions import (
+    AfcDeleteError,
     AfcException,
     AfcFileNotFoundError,
     NotificationTimeoutError,
@@ -20,7 +21,7 @@ from pymobiledevice3.exceptions import (
 from pymobiledevice3.interactive_shell import Arg, shell_command
 from pymobiledevice3.lockdown import LockdownClient
 from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
-from pymobiledevice3.services.afc import AfcService, AfcShell, RemotePath
+from pymobiledevice3.services.afc import AfcError, AfcService, AfcShell, RemotePath
 from pymobiledevice3.services.lockdown_service import LockdownService
 from pymobiledevice3.services.notification_proxy import NotificationProxyService
 from pymobiledevice3.services.os_trace import OsTraceService
@@ -92,30 +93,74 @@ class CrashReportsManager:
         """Close the underlying AFC connection."""
         await self.afc.aclose()
 
-    async def clear(self, path: str = "/") -> None:
+    async def clear(self, path: str = "/", match: Optional[str] = None) -> None:
         """
-        Delete all crash reports under a path.
+        Delete crash reports under a path.
 
-        Lists the immediate children of ``path`` and removes each recursively. A
-        ``com.apple.appstored`` entry that the device may recreate immediately after deletion is
-        tolerated; any other item that could not be deleted is treated as an error.
+        Without ``match``, lists the immediate children of ``path`` and removes each recursively.
+        With ``match``, removes exactly the files `pull` would copy for the same regex (see
+        `AfcService.rm`), without copying them; directories are kept.
+
+        Some items cannot be deleted, and these are tolerated:
+        - a ``com.apple.appstored`` entry, which the device may recreate right after it is deleted;
+        - the files of a sysdiagnose that is still running or was interrupted, which the device does not
+          let anyone delete (logged as a warning).
+        An item the device removes while it is being cleared counts as deleted.
 
         :param path: Path under the crash reports directory to clear. Defaults to '/'.
-        :raises AfcException: If any item other than ``com.apple.appstored`` could not be deleted.
+        :param match: Optional regex over entry basenames, applied as `pull` applies it.
+        :raises AfcDeleteError: If any other item could not be deleted; ``failures`` says why for each.
         """
-        undeleted_items: list[str] = []
-        for filename in await self.ls(path, depth=1):
-            undeleted_items.extend(await self.afc.rm(filename, force=True))
+        failures: dict[str, int] = {}
+        if match is not None:
+            failures.update(await self._rm(path, match=re.compile(match)))
+        else:
+            for filename in await self.ls(path, depth=1):
+                failures.update(await self._rm(filename))
 
-        for item in undeleted_items:
-            # special case of file that sometimes created automatically right after delete,
-            # and then we can't delete the folder because it's not empty
-            if item != self.APPSTORED_PATH:
-                # AfcException mis-annotates `status` as str; it accepts AfcError/None at runtime
-                raise AfcException(
-                    f"failed to clear crash reports under {path!r}, undeleted items: {undeleted_items}",
-                    None,
-                )
+        # special case of file that sometimes created automatically right after delete,
+        # and then we can't delete the folder because it's not empty
+        failures.pop(self.APPSTORED_PATH, None)
+        # a directory that keeps an undeletable entry cannot go either; report only the entries themselves
+        failures = {
+            failed: status
+            for failed, status in failures.items()
+            if not any(other.startswith(failed.rstrip("/") + "/") for other in failures)
+        }
+        sysdiagnose_dir = f"/{SYSDIAGNOSE_DIR}/"
+        protected = sorted({
+            failed[len(sysdiagnose_dir) :].split("/", 1)[0]
+            for failed, status in failures.items()
+            if failed.startswith(sysdiagnose_dir) and status == AfcError.PERM_DENIED
+        })
+        others = {
+            failed: status
+            for failed, status in failures.items()
+            if not (failed.startswith(sysdiagnose_dir) and status == AfcError.PERM_DENIED)
+        }
+        if protected:
+            self.logger.warning(
+                f"The device does not allow deleting the files of a sysdiagnose that is still running or was "
+                f"interrupted; kept under /{SYSDIAGNOSE_DIR}: {', '.join(protected)}"
+            )
+        if others:
+            raise AfcDeleteError(
+                f"Could not clear the crash reports under {path!r}: "
+                + ", ".join(f"{failed} ({getattr(status, 'name', status)})" for failed, status in others.items()),
+                others,
+            )
+
+    async def _rm(self, filename: str, match: Optional[re.Pattern[str]] = None) -> dict[str, int]:
+        """What ``filename`` (or the files under it matching ``match``) kept that could not be deleted, and why."""
+        try:
+            await self.afc.rm(filename, match=match)
+        except AfcDeleteError as e:
+            return e.failures
+        except AfcException as e:
+            if e.status != AfcError.OBJECT_NOT_FOUND:
+                raise
+            # listed, then removed by the device before we got to it
+        return {}
 
     async def ls(self, path: str = "/", depth: int = 1) -> list[str]:
         """
@@ -230,10 +275,10 @@ class CrashReportsManager:
         the CrashReports directory and acknowledges with a ``ping`` once done.
         """
         ack = b"ping\x00"
-        service = await self.lockdown.start_lockdown_service(self.crash_mover_service_name)
-        response = await service.recvall(len(ack))
+        async with await self.lockdown.start_lockdown_service(self.crash_mover_service_name) as service:
+            response = await service.recvall(len(ack))
         if response != ack:
-            raise ProtocolError(f"got invalid response: {response!r}")
+            raise ProtocolError(f"The crash report mover sent an unexpected acknowledgement: {response!r}")
 
     async def watch(
         self, name: Optional[str] = None, raw: bool = False
@@ -330,7 +375,7 @@ class CrashReportsManager:
                     await asyncio.sleep(IOS17_SYSDIAGNOSE_DELAY)
                     break
             except NotificationTimeoutError as e:
-                raise SysdiagnoseTimeoutError("Timeout waiting for sysdiagnose completion") from e
+                raise SysdiagnoseTimeoutError("Timed out waiting for the sysdiagnose to complete.") from e
 
     async def _get_new_sysdiagnose_filename(self, end_time: Optional[float] = None) -> str:
         sysdiagnose_filename = None
@@ -361,7 +406,9 @@ class CrashReportsManager:
                 pass
 
             if self._check_timeout(end_time):
-                raise SysdiagnoseTimeoutError("Timeout finding in-progress sysdiagnose filename")
+                raise SysdiagnoseTimeoutError(
+                    "Timed out waiting for the device to start writing the sysdiagnose archive."
+                )
             await asyncio.sleep(0.1)
 
         # unreachable in practice (the loop only exits via return/raise); satisfies the declared return type

@@ -35,6 +35,23 @@ device's product type and lets you pick one interactively; that needs network
 access and works from normal mode as well as recovery (the product type comes
 from lockdown or from the recovery-mode device table).
 
+To stop downloading the same multi-GB IPSW on every run, pass `--ipsw-dir`
+(or set `PYMOBILEDEVICE3_IPSW_DIR` once; a leading `~` is expanded). Downloads then go into that directory
+under Apple's filename (e.g. `iPhone12,1_27.2_24B119_Restore.ipsw`) and are
+kept. A file already there with that name is used as-is, without re-hashing,
+and the interactive picker marks such builds `(local)`. A new download is
+written to `<name>.part`, which a later run resumes after an interruption, and
+is renamed into place only once it matches its SHA-256 (the one Apple's CDN
+publishes for the file, else ipsw.me's); a mismatching download is discarded.
+A single Ctrl-C stops the download and keeps the `.part`. If ipsw.me can't be
+reached, the picker reports it and exits.
+
+`--beta` lists the newest beta builds instead, from
+[AppleDB](https://appledb.dev) (ipsw.me has no betas), restricted to those with
+an IPSW for the device: e.g. `27.2 beta 4: 24B5110a`. AppleDB's signing status
+is shown as `(unsigned)` but is only a hint; TSS decides at restore time.
+`--ipsw-dir`, resuming and SHA-256 verification work the same way.
+
 Whatever the source, the build must be signed by Apple at restore time, since
 the AP ticket comes from TSS. A `--tss` SHSH blob can be supplied for the AP
 ticket instead of asking TSS; the peripheral tickets are still requested live.
@@ -50,6 +67,56 @@ usable data volume, or to wipe it.
 
 `--ignore-fdr` is a debugging option: the host connects to the FDR service but
 does not proxy its traffic.
+
+## Restoring from DFU mode
+
+DFU mode is entered with a button sequence; the host cannot enter it alone.
+`--dfu` walks you through it before the restore starts, and `restore enter-dfu`
+does just that part:
+
+```shell
+pymobiledevice3 restore update -i iPhone.ipsw --dfu
+pymobiledevice3 restore enter-dfu
+```
+
+The guide picks the buttons for the model (iPhones by product type; for an iPad
+it asks whether there is a Home button), counts each step down, and watches the
+device over USB: its screen going black, then the device coming back in DFU mode
+(classic DFU, or Debug USB/KIS on A16 and later), in recovery, or booted
+normally. Each step moves on as soon as the device reacts, and if it ends up
+anywhere but DFU the guide says what to change and offers another try. Apple
+documents only the recovery mode sequences; the DFU ones are the widely used
+sequences.
+
+On an iPhone 8 or later that is booted, the host restarts the phone itself, so
+the quick VOLUME UP, VOLUME DOWN, SIDE presses go away: you hold VOLUME DOWN,
+the phone restarts, you add SIDE once it went down, then release SIDE. `--manual`
+keeps the full button sequence instead.
+
+On macOS, an A16-or-later device in DFU mode (Debug USB/KIS) can only be opened
+by Apple's `deviceinterfaced`, so the restore loads its images through that
+daemon; elsewhere it talks KIS to the device over libusb.
+
+## Keeping deviceinterfaced off the device
+
+macOS's `deviceinterfaced` can claim the USB device while it re-enumerates
+during a restore, so the device in DFU mode is never seen. `--exclusive-usb` (experimental, macOS only) keeps
+the daemon off for the restore: it boots it out, or keeps killing it where
+System Integrity Protection refuses that, and loads and starts it again when the
+restore ends. The `launchctl` calls run through `sudo` and may prompt for your
+password. It cannot be used with an A16-or-later device in DFU mode on macOS,
+which is reached through that daemon.
+
+## How the host reaches the device
+
+On macOS, devices in recovery and DFU mode are reached through IOKit; elsewhere
+through libusb. A16-or-later devices in DFU mode go through `deviceinterfaced`
+on macOS (see above). `restore --libusb` (or `PYMOBILEDEVICE3_USB_BACKEND=libusb`)
+switches macOS to libusb, e.g. to compare the two:
+
+```shell
+pymobiledevice3 restore --libusb update -i iPhone.ipsw
+```
 
 ## Several devices at once
 
@@ -71,12 +138,30 @@ option takes either form.
 
 - `restore enter` puts a normal-mode device into recovery; `restore exit`
   re-enables auto-boot and reboots a recovery-mode device back to iOS;
-  `restore restart` reboots either.
+  `restore restart` reboots either (see below for `--vdm`).
 - `restore tss` requests (and with `--out` saves) the AP ticket for a build
   without restoring, `--behavior Update|Erase` selecting the identity.
 - `restore ramdisk` boots the IPSW's restore ramdisk and stops there.
 - `restore shell` opens an IPython shell with the iBoot (`irecv`) client of a
   recovery/DFU device.
+
+## Restarting over USB-C (macOS)
+
+`restore restart --vdm` restarts the device with Apple's USB Power Delivery
+reboot message, sent by the Mac's own USB-C port controller. The device's USB-C
+controller handles it, not iOS, so it needs no pairing or trust and works in
+recovery mode too:
+
+```shell
+sudo pymobiledevice3 restore restart --vdm
+```
+
+- It needs root: only root can open the port controller.
+- The device has to be on a Thunderbolt/USB4 port, the ports with Apple's PD
+  controller, and connected directly: a hub in between does not pass the
+  message on.
+- With several Apple devices on such ports, the command asks which one to
+  restart; `--ecid` picks it non-interactively.
 
 ## Inspecting the preflight data
 

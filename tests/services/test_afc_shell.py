@@ -1,9 +1,11 @@
 import asyncio
+import hashlib
 import os
 import shutil
 import sys
 from collections.abc import AsyncGenerator
 from contextlib import suppress
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -50,10 +52,10 @@ def shell(afc: AfcService) -> AfcShell:
 
 
 @pytest.mark.device
-def test_create_runs_a_shell_until_exit(capfd: pytest.CaptureFixture[str]) -> None:
+def test_create_runs_a_shell_until_exit(pytestconfig: pytest.Config, capfd: pytest.CaptureFixture[str]) -> None:
     """The blocking entry point: it builds the service itself and runs on the CLI event loop."""
     loop = get_asyncio_loop()
-    lockdown = loop.run_until_complete(create_using_usbmux())
+    lockdown = loop.run_until_complete(create_using_usbmux(serial=pytestconfig.getoption("--udid")))
     try:
         with create_pipe_input() as pipe_input, create_app_session(input=pipe_input, output=DummyOutput()):
             pipe_input.send_text("pwd\rexit\r")
@@ -80,7 +82,9 @@ async def test_pwd_and_cd(shell: AfcShell, capfd: pytest.CaptureFixture[str]) ->
 
 async def test_cd_to_missing_directory_fails_and_stays(shell: AfcShell, capfd: pytest.CaptureFixture[str]) -> None:
     assert await shell.run_line("cd nope") != 0
-    assert "nope does not exist" in capfd.readouterr().err
+    err = capfd.readouterr().err
+    assert "No such directory: " in err
+    assert "nope" in err
     assert shell.cwd == ROOT
 
 
@@ -144,6 +148,19 @@ async def test_walk_head_hexdump_info(shell: AfcShell, capfd: pytest.CaptureFixt
     assert "68 65 6c 6c 6f" in capfd.readouterr().out.lower()
     assert await shell.run_line("info") == 0
     assert "FSTotalBytes" in capfd.readouterr().out
+
+
+async def test_sha1sum_touch_truncate(shell: AfcShell, afc: AfcService, capfd: pytest.CaptureFixture[str]) -> None:
+    assert await shell.run_line("sha1sum hello.txt blob.bin") == 0
+    hello_digest = hashlib.sha1(b"hello\nworld\n").hexdigest()
+    assert capfd.readouterr().out == f"{hello_digest}  hello.txt\n{hashlib.sha1(BINARY).hexdigest()}  blob.bin\n"
+    await afc.set_file_time(f"{TEST_DIR}/hello.txt", datetime(2020, 1, 1))
+    assert await shell.run_line("touch hello.txt new.txt") == 0
+    assert (await afc.stat(f"{TEST_DIR}/hello.txt"))["st_mtime"] > datetime(2020, 1, 1)
+    assert await afc.get_file_contents(f"{TEST_DIR}/new.txt") == b""
+    assert await shell.run_line("truncate -s 5 hello.txt && truncate --size 3 blob.bin") == 0
+    assert await afc.get_file_contents(f"{TEST_DIR}/hello.txt") == b"hello"
+    assert await afc.get_file_contents(f"{TEST_DIR}/blob.bin") == BINARY[:3]
 
 
 async def test_push_and_pull_round_trip(shell: AfcShell, tmp_path: Path, capfd: pytest.CaptureFixture[str]) -> None:

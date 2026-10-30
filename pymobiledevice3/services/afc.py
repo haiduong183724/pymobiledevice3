@@ -9,6 +9,7 @@ interactive shell for navigating the device's file system rooted at /var/mobile/
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import os
 import pathlib
@@ -45,9 +46,14 @@ from pygnuutils.cli.ls import ls as ls_cli
 from pygnuutils.ls import Ls, LsStub
 
 from pymobiledevice3.common import get_home_folder
-from pymobiledevice3.exceptions import AfcException, AfcFileNotFoundError, ArgumentError, ConnectionTerminatedError
+from pymobiledevice3.exceptions import (
+    AfcDeleteError,
+    AfcException,
+    AfcFileNotFoundError,
+    ArgumentError,
+    ConnectionTerminatedError,
+)
 from pymobiledevice3.interactive_shell import Arg, CompletionContext, InteractiveShell, shell_command
-from pymobiledevice3.lockdown import LockdownClient
 from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
 from pymobiledevice3.progress import BYTES_UNIT, ProgressBar
 from pymobiledevice3.safe_paths import device_file_path, validate_device_filename
@@ -105,7 +111,13 @@ class AfcOpcode(OpenIntEnum):
     SET_SOCKET_BS = 0x0000001A  # SetSocketBlockSize (0x800000)
     FILE_LOCK = 0x0000001B  # FileRefLock
     MAKE_LINK = 0x0000001C  # MakeLink
+    GET_FILE_HASH = 0x0000001D  # GetFileHash (SHA-1)
     SET_FILE_TIME = 0x0000001E  # set st_mtime
+    GET_FILE_HASH_RANGE = 0x0000001F  # GetFileHashWithRange (SHA-1)
+    GET_SIZE_OF_PATH_CONTENTS = 0x00000021  # GetSizeOfPathContents
+    REMOVE_PATH_AND_CONTENTS = 0x00000022  # RemovePathAndContents (rm -rf, iOS 6+)
+    FILE_READ_OFFSET = 0x00000027  # FileRefReadWithOffset (pread)
+    FILE_WRITE_OFFSET = 0x00000028  # FileRefWriteWithOffset (pwrite)
 
 
 class AfcError(OpenIntEnum):
@@ -247,6 +259,52 @@ class AfcFileSeekRequest(BinaryStruct, byte_order="<"):
     offset: i64
 
 
+@dataclass
+class AfcFileSetSizeRequest(BinaryStruct, byte_order="<"):
+    handle: u64
+    size: u64
+
+
+@dataclass
+class AfcFreadOffsetRequest(BinaryStruct, byte_order="<"):
+    handle: u64
+    size: u64
+    offset: u64
+
+
+@dataclass
+class AfcFwriteOffsetHeader(BinaryStruct, byte_order="<"):
+    """Header payload of ``FILE_WRITE_OFFSET``; the data to write follows as the packet payload."""
+
+    handle: u64
+    offset: u64
+
+
+@dataclass
+class AfcTruncateRequest(BinaryStruct, byte_order="<"):
+    size: u64
+    filename: Annotated[str, CSTRING]
+
+
+@dataclass
+class AfcSetFileTimeRequest(BinaryStruct, byte_order="<"):
+    mtime: u64  # nanoseconds since the epoch
+    filename: Annotated[str, CSTRING]
+
+
+@dataclass
+class AfcFileHashRangeRequest(BinaryStruct, byte_order="<"):
+    start: u64
+    length: u64
+    filename: Annotated[str, CSTRING]
+
+
+@dataclass
+class AfcSizeOfPathContentsRequest(BinaryStruct, byte_order="<"):
+    flags: u64
+    filename: Annotated[str, CSTRING]
+
+
 def list_to_dict(raw: bytes) -> dict[str, str]:
     """
     Convert a null-terminated key-value list to a dictionary.
@@ -290,8 +348,6 @@ class AfcService(LockdownService):
         :param lockdown: Lockdown service provider for establishing connection
         :param service_name: Optional service name override. Auto-detected if None
         """
-        if service_name is None:
-            service_name = self.SERVICE_NAME if isinstance(lockdown, LockdownClient) else self.RSD_SERVICE_NAME
         super().__init__(lockdown, service_name)
         self.packet_num = 0
         # Demux state — populated in __aenter__, torn down in __aexit__
@@ -638,62 +694,99 @@ class AfcService(LockdownService):
         """
         Recursively remove a file or directory tree on the device.
 
+        Without ``match``, the device removes the whole tree in a single ``REMOVE_PATH_AND_CONTENTS``
+        operation; if that fails, the tree is walked instead.
+
         For a directory, every entry is removed depth-first and the directory itself is removed
-        last. The ``match`` pattern, when given, filters which top-level entries of ``filename``
-        are considered (matched against their basename via ``match``); nested entries are always
-        removed once their parent is selected.
+        last.
+
+        With ``match``, the same entries `pull` would copy are removed: at every level, entries whose
+        basename does not match (via ``search``) are skipped, matching directories are descended into
+        with the same pattern, and matching files are removed. Directories (including ``filename``
+        itself) are never removed in this mode.
+
+        A path removed by someone else while the tree is walked counts as deleted.
 
         :param filename: Path to the file or directory to remove.
-        :param match: Optional regex; only directory entries whose basename matches are removed.
-            None removes all entries.
+        :param match: Optional regex over entry basenames, applied as `pull` applies it. None removes
+            the whole tree.
         :param force: If True, suppress the final `AfcException` and instead return the
             list of paths that could not be deleted.
         :return: List of paths that could not be deleted (empty on full success).
-        :raises AfcException: if any path could not be deleted and ``force`` is False.
+        :raises AfcException: if ``filename`` does not exist and ``force`` is False.
+        :raises AfcDeleteError: if any path could not be deleted and ``force`` is False; its ``failures`` say why.
         """
-        if not await self.exists(filename) and not await self.rm_single(filename, force=force):
-            return [filename]
-
-        # single file
-        if not await self.isdir(filename):
-            if await self.rm_single(filename, force=force):
+        if match is None:
+            # let the device delete the whole tree in one round-trip; on any failure fall back to
+            # walking it, which also reports exactly which entries could not be deleted
+            with contextlib.suppress(AfcException):
+                await self._do_operation(AfcOpcode.REMOVE_PATH_AND_CONTENTS, CSTRING.build(filename), filename)
                 return []
-            return [filename]
 
-        # directory content
-        undeleted_items: list[str] = []
-        for entry in await self.listdir(filename):
-            current_filename = posixpath.join(filename, entry)
-
-            if match is not None and not match.match(posixpath.basename(current_filename)):
-                continue
-
-            if await self.isdir(current_filename):
-                ret_undeleted_items = await self.rm(current_filename, force=True)
-                undeleted_items.extend(ret_undeleted_items)
-            else:
-                if not await self.rm_single(current_filename, force=True):
-                    undeleted_items.append(current_filename)
-
-        # directory path
-        try:
+        if not await self.exists(filename):
+            # a missing path is an error (a dangling link, which cannot be stat'ed, is still removed here)
             if not await self.rm_single(filename, force=force):
-                undeleted_items.append(filename)
-                return undeleted_items
-        except AfcException:
-            if undeleted_items:
-                undeleted_items.append(filename)
-            else:
-                raise
+                return [filename]
+            return []
 
-        if undeleted_items:
-            # AfcException mis-annotates `status` as str; it accepts AfcError/None at runtime
-            raise AfcException(
-                f"Failed to delete paths: {undeleted_items}",
-                None,
+        failures = await self._rm_tree(filename) if match is None else await self._rm_matching(filename, match)
+        if failures and not force:
+            raise AfcDeleteError(
+                "Failed to delete: "
+                + ", ".join(f"{path} ({getattr(status, 'name', status)})" for path, status in failures.items()),
+                dict(failures),
             )
+        return list(failures)
 
-        return []
+    async def _remove(self, filename: str) -> Optional[AfcError]:
+        """Remove a file or an empty directory; the device's reason when it did not, None when it is gone."""
+        try:
+            await self._do_operation(AfcOpcode.REMOVE_PATH, CSTRING.build(filename), filename)
+        except AfcException as e:
+            if e.status == AfcError.OBJECT_NOT_FOUND:
+                # removed meanwhile (e.g. by the device itself): what was asked for holds
+                return None
+            return AfcError(e.status) if e.status is not None else AfcError.UNKNOWN_ERROR
+        return None
+
+    async def _rm_tree(self, filename: str) -> dict[str, AfcError]:
+        """Remove ``filename`` and, for a directory, everything under it depth-first; return what was not removed."""
+        try:
+            is_dir = await self.isdir(filename)
+        except AfcFileNotFoundError:
+            # gone, or a dangling link the device cannot stat: removing it settles both
+            is_dir = False
+        failures: dict[str, AfcError] = {}
+        if is_dir:
+            try:
+                entries = await self.listdir(filename)
+            except AfcFileNotFoundError:
+                entries = []
+            for entry in entries:
+                failures.update(await self._rm_tree(posixpath.join(filename, entry)))
+        status = await self._remove(filename)
+        if status is not None:
+            failures[filename] = status
+        return failures
+
+    async def _rm_matching(self, filename: str, match: Pattern[str]) -> dict[str, AfcError]:
+        """Remove the files under ``filename`` that `pull` would copy for ``match``; return what was not removed."""
+        try:
+            is_dir = await self.isdir(filename)
+        except AfcFileNotFoundError:
+            return {}
+        if not is_dir:
+            if not match.search(posixpath.basename(filename)):
+                return {}
+            status = await self._remove(filename)
+            return {} if status is None else {filename: status}
+
+        failures: dict[str, AfcError] = {}
+        for entry in await self.listdir(filename):
+            if not match.search(entry):
+                continue
+            failures.update(await self._rm_matching(posixpath.join(filename, entry), match))
+        return failures
 
     async def get_device_info(self):
         """
@@ -769,7 +862,7 @@ class AfcService(LockdownService):
         except AfcException as e:
             if e.status != AfcError.READ_ERROR:
                 raise
-            raise AfcFileNotFoundError(e.args[0], e.status) from e
+            raise AfcFileNotFoundError(f"No such file on the device: {filename}", e.status, filename) from e
 
         stat["st_size"] = int(stat["st_size"])
         stat["st_blocks"] = int(stat["st_blocks"])
@@ -832,6 +925,97 @@ class AfcService(LockdownService):
         )
 
     @path_to_str()
+    async def truncate(self, filename: str, size: int) -> None:
+        """
+        Truncate or extend a file to ``size`` bytes (``truncate(2)``).
+
+        :param filename: Path to the file.
+        :param size: The new file size in bytes.
+        :raises AfcFileNotFoundError: if the file does not exist.
+        :raises AfcException: if the operation fails.
+        """
+        await self._do_operation(AfcOpcode.TRUNCATE, AfcTruncateRequest(size=size, filename=filename).build(), filename)
+
+    @path_to_str()
+    async def set_file_time(self, filename: str, mtime: datetime) -> None:
+        """
+        Set the modification time of a file or directory.
+
+        The device stores the time with microsecond resolution, and moves ``st_birthtime`` back
+        to ``mtime`` when ``mtime`` is the earlier of the two.
+
+        :param filename: Path to the file or directory.
+        :param mtime: The new modification time (naive values are local time, as `stat` returns).
+        :raises AfcFileNotFoundError: if the path does not exist.
+        :raises AfcException: if the operation fails.
+        """
+        mtime_ns = round(mtime.timestamp() * 1_000_000) * 1000
+        await self._do_operation(
+            AfcOpcode.SET_FILE_TIME, AfcSetFileTimeRequest(mtime=mtime_ns, filename=filename).build(), filename
+        )
+
+    @path_to_str()
+    async def get_file_hash(self, filename: str) -> bytes:
+        """
+        Get the SHA-1 digest of a file, computed on the device.
+
+        :param filename: Path to the file.
+        :return: The 20-byte SHA-1 digest.
+        :raises AfcFileNotFoundError: if the file does not exist.
+        :raises AfcException: if the path is a directory (``OBJECT_IS_DIR``) or the operation fails.
+        """
+        try:
+            return await self._do_operation(AfcOpcode.GET_FILE_HASH, CSTRING.build(filename), filename)
+        except AfcException as e:
+            # The device rejects hashing an empty file with INVALID_ARG
+            if e.status != AfcError.INVALID_ARG or (await self.stat(filename))["st_size"] != 0:
+                raise
+            return hashlib.sha1(b"").digest()
+
+    @path_to_str()
+    async def get_file_hash_range(self, filename: str, start: int, length: int) -> bytes:
+        """
+        Get the SHA-1 digest of ``length`` bytes of a file starting at ``start``, computed on the device.
+
+        :param filename: Path to the file.
+        :param start: Offset of the first byte to hash.
+        :param length: Number of bytes to hash; the range must lie within the file.
+        :return: The 20-byte SHA-1 digest.
+        :raises AfcFileNotFoundError: if the file does not exist.
+        :raises AfcException: if the range exceeds the file (``INVALID_ARG``) or the operation fails.
+        """
+        return await self._do_operation(
+            AfcOpcode.GET_FILE_HASH_RANGE,
+            AfcFileHashRangeRequest(start=start, length=length, filename=filename).build(),
+            filename,
+        )
+
+    @path_to_str()
+    async def get_size_of_path_contents(self, filename: str) -> dict[str, int]:
+        """
+        Get the total size of the regular files under a directory, computed on the device.
+
+        :param filename: Path to the directory (a regular file reports zero).
+        :return: ``{"st_size": <bytes>, "st_blocks": <512-byte blocks>}``.
+        :raises AfcFileNotFoundError: if the path does not exist.
+        :raises AfcException: if the operation fails.
+        """
+        data = await self._do_operation(
+            AfcOpcode.GET_SIZE_OF_PATH_CONTENTS,
+            AfcSizeOfPathContentsRequest(flags=0, filename=filename).build(),
+            filename,
+        )
+        return {k: int(v) for k, v in list_to_dict(data).items()}
+
+    async def get_connection_info(self) -> dict[str, str]:
+        """
+        Query information about the AFC connection (e.g. the server ``Version``).
+
+        :return: Dictionary of connection attributes (all values are strings).
+        """
+        return list_to_dict(await self._do_operation(AfcOpcode.GET_CON_INFO))
+
+    @path_to_str()
     async def fopen(self, filename: str, mode: str = "r") -> int:
         """
         Open a file on the device and return its handle.
@@ -845,7 +1029,7 @@ class AfcService(LockdownService):
         :raises AfcException: if the file could not be opened.
         """
         if mode not in AFC_FOPEN_TEXTUAL_MODES:
-            raise ArgumentError(f"mode can be only one of: {AFC_FOPEN_TEXTUAL_MODES.keys()}")
+            raise ArgumentError(f"Invalid file mode {mode!r}; use one of: {', '.join(AFC_FOPEN_TEXTUAL_MODES)}")
 
         data = await self._do_operation(
             AfcOpcode.FILE_OPEN,
@@ -882,7 +1066,7 @@ class AfcService(LockdownService):
             if await self.exists(source):
                 raise
             raise AfcFileNotFoundError(
-                f"Failed to rename {source} into {target}. Got status: {e.status}", e.args[0], str(e.status)
+                f"Failed to rename {source} to {target}: {source} no longer exists.", e.status, source
             ) from e
 
     async def fread(self, handle: int, sz: int) -> bytes:
@@ -906,7 +1090,7 @@ class AfcService(LockdownService):
                 AfcOpcode.READ, AfcFreadRequest(handle=handle, size=to_read).build()
             )
             if status != AfcError.SUCCESS:
-                raise AfcException("fread error", status)
+                raise AfcException("Failed to read from the file.", status)
             sz -= to_read
             data += chunk
         return data
@@ -924,6 +1108,77 @@ class AfcService(LockdownService):
             AfcOpcode.FILE_SEEK,
             AfcFileSeekRequest(handle=handle, whence=whence, offset=offset).build(),
         )
+
+    async def ftell(self, handle: int) -> int:
+        """
+        Get the current position of an open file handle.
+
+        :param handle: Handle returned by `fopen`.
+        :return: The current byte offset.
+        :raises AfcException: if the tell operation fails.
+        """
+        return U64_LE.unpack(await self._do_operation(AfcOpcode.FILE_TELL, U64_LE.pack(handle)))[0]
+
+    async def ftruncate(self, handle: int, size: int) -> None:
+        """
+        Truncate or extend an open file to ``size`` bytes (``ftruncate(2)``).
+
+        The handle's position is left unchanged.
+
+        :param handle: Handle returned by `fopen` with a writable mode.
+        :param size: The new file size in bytes.
+        :raises AfcException: if the operation fails.
+        """
+        await self._do_operation(AfcOpcode.FILE_SET_SIZE, AfcFileSetSizeRequest(handle=handle, size=size).build())
+
+    async def pread(self, handle: int, size: int, offset: int) -> bytes:
+        """
+        Read from an open file handle at an absolute offset (``pread(2)``).
+
+        The handle's position is left unchanged. Reads past the end of the file are short.
+
+        :param handle: Handle returned by `fopen`.
+        :param size: Number of bytes to read. Reads larger than ``MAXIMUM_READ_SIZE`` are split
+            into successive operations.
+        :param offset: Byte offset to read from.
+        :return: The bytes read.
+        :raises AfcException: if a read operation fails.
+        """
+        data = b""
+        while size > 0:
+            to_read = min(size, MAXIMUM_READ_SIZE)
+            chunk = await self._do_operation(
+                AfcOpcode.FILE_READ_OFFSET,
+                AfcFreadOffsetRequest(handle=handle, size=to_read, offset=offset).build(),
+            )
+            data += chunk
+            if len(chunk) < to_read:
+                break
+            size -= to_read
+            offset += to_read
+        return data
+
+    async def pwrite(self, handle: int, data: bytes, offset: int, chunk_size: int = MAXIMUM_WRITE_SIZE) -> None:
+        """
+        Write to an open file handle at an absolute offset (``pwrite(2)``).
+
+        The handle's position is left unchanged; writing past the end extends the file.
+
+        :param handle: Handle returned by `fopen` with a writable mode.
+        :param data: Bytes to write.
+        :param offset: Byte offset to write at.
+        :param chunk_size: Maximum bytes per ``FILE_WRITE_OFFSET`` operation.
+        :raises AfcException: if a write operation fails.
+        """
+        for start in range(0, len(data), chunk_size):
+            header = AfcFwriteOffsetHeader(handle=handle, offset=offset + start).build()
+            status, _ = await self._send_and_wait(
+                AfcOpcode.FILE_WRITE_OFFSET,
+                header + data[start : start + chunk_size],
+                this_length=AFC_HEADER_SIZE + len(header),
+            )
+            if status != AfcError.SUCCESS:
+                raise AfcException("Failed to write to the file.", status)
 
     async def fwrite(self, handle: int, data: bytes, chunk_size: int = MAXIMUM_WRITE_SIZE) -> None:
         """
@@ -944,13 +1199,13 @@ class AfcService(LockdownService):
             chunk = data[i * chunk_size : (i + 1) * chunk_size]
             status, _ = await self._send_and_wait(AfcOpcode.WRITE, file_handle + chunk, this_length=48)
             if status != AfcError.SUCCESS:
-                raise AfcException(f"failed to write chunk: {status}", status)
+                raise AfcException("Failed to write to the file.", status)
 
         if len(data) % chunk_size:
             chunk = data[chunks_count * chunk_size :]
             status, _ = await self._send_and_wait(AfcOpcode.WRITE, file_handle + chunk, this_length=48)
             if status != AfcError.SUCCESS:
-                raise AfcException(f"failed to write last chunk: {status}", status)
+                raise AfcException("Failed to write to the file.", status)
 
     @path_to_str()
     async def resolve_path(self, filename: str) -> str:
@@ -988,17 +1243,17 @@ class AfcService(LockdownService):
         info = await self.stat(filename)
 
         if info["st_ifmt"] != "S_IFREG":
-            raise AfcException(f"{filename} isn't a file", AfcError.INVALID_ARG, filename)
+            raise AfcException(f"Not a regular file: {filename}", AfcError.INVALID_ARG, filename)
 
         h = await self.fopen(filename)
         if not h:
-            raise AfcException(f"failed to open {filename}", AfcError.INTERNAL_ERROR, filename)
+            raise AfcException(f"Failed to open {filename}", AfcError.INTERNAL_ERROR, filename)
         d = await self.fread(h, int(info["st_size"]))
         await self.fclose(h)
         return d
 
     @path_to_str()
-    async def set_file_contents(self, filename: str, data: bytes) -> None:
+    async def set_file_contents(self, filename: str, data: bytes, progress: Optional[ProgressBar] = None) -> None:
         """
         Write data to a file, creating or truncating it.
 
@@ -1006,11 +1261,18 @@ class AfcService(LockdownService):
 
         :param filename: Path to the file.
         :param data: Bytes to write.
+        :param progress: Optional bar advanced as chunks are written.
         :raises AfcException: if the open or write operation fails.
         """
         h = await self.fopen(filename, "w")
-        await self.fwrite(h, data)
-        await self.fclose(h)
+        try:
+            for offset in range(0, len(data), MAXIMUM_READ_SIZE):
+                chunk = data[offset : offset + MAXIMUM_READ_SIZE]
+                await self.fwrite(h, chunk)
+                if progress is not None:
+                    progress.update(len(chunk))
+        finally:
+            await self.fclose(h)
 
     @path_to_str()
     async def walk(self, dirname: str) -> AsyncIterator[tuple[str, list[str], list[str]]]:
@@ -1101,32 +1363,6 @@ class AfcService(LockdownService):
         self.packet_num += 1
         await self.service.sendall(header + data)
         return pkt_num
-
-    async def _receive_data(self):
-        """
-        Receive an AFC protocol response packet from the device.
-
-        .. deprecated::
-            Internal use only. External callers should use `_do_operation` or
-            `_send_and_wait` which use the background demux reader.
-
-        :return: Tuple of (status_code, response_data)
-        """
-        header_bytes = await self.service.recvall(AFC_HEADER_SIZE)
-        status = AfcError.SUCCESS
-        data = b""
-        if header_bytes:
-            header = AfcHeader.parse(header_bytes)
-            assert header.entire_length >= AFC_HEADER_SIZE
-            length = header.entire_length - AFC_HEADER_SIZE
-            data = await self.service.recvall(length)
-            if header.operation == AfcOpcode.STATUS:
-                if length != 8:
-                    self.logger.error("Status length != 8")
-                status = parse_afc_status(data)
-            elif header.operation != AfcOpcode.DATA:
-                self.logger.debug("Unexpected AFC opcode %s", header.operation)
-        return status, data
 
     async def _send_and_wait(self, operation: AfcOpcode, data: bytes, this_length: int = 0):
         """
@@ -1450,7 +1686,7 @@ class AfcShell(InteractiveShell):
         directory = self.relative_path(directory)
         directory = posixpath.normpath(directory)
         if not await self.afc.exists(directory):
-            raise ArgumentError(f"{directory} does not exist")
+            raise ArgumentError(f"No such directory: {directory}")
         self.cwd = directory
 
     @shell_command(raw=True, completer=path_completer)
@@ -1603,6 +1839,41 @@ class AfcShell(InteractiveShell):
         """
         for k, v in (await self.afc.stat(self.relative_path(filename))).items():
             print(f"{k}: {v}")
+
+    @shell_command
+    async def _do_sha1sum(self, files: list[RemotePath]):
+        """
+        Print the SHA-1 digest of files, computed on the device.
+
+        :param files: Paths of the files to hash
+        """
+        for filename in files:
+            print(f"{(await self.afc.get_file_hash(self.relative_path(filename))).hex()}  {filename}")
+
+    @shell_command
+    async def _do_touch(self, files: list[RemotePath]):
+        """
+        Set the modification time of files to now, creating missing ones empty.
+
+        :param files: Paths of the files to touch
+        """
+        for filename in files:
+            path = self.relative_path(filename)
+            if await self.afc.exists(path):
+                await self.afc.set_file_time(path, datetime.now())
+            else:
+                await self.afc.set_file_contents(path, b"")
+
+    @shell_command
+    async def _do_truncate(self, files: list[RemotePath], *, size: Annotated[int, Arg("-s")]):
+        """
+        Shrink or extend files to a given size.
+
+        :param files: Paths of the files to resize
+        :param size: The new size in bytes
+        """
+        for filename in files:
+            await self.afc.truncate(self.relative_path(filename), size)
 
     @staticmethod
     def _write(data: bytes) -> None:

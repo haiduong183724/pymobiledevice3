@@ -1,3 +1,4 @@
+import enum
 import hashlib
 import logging
 import plistlib
@@ -24,7 +25,6 @@ from pymobiledevice3.exceptions import (
     RSDRequiredError,
     UnsupportedCommandError,
 )
-from pymobiledevice3.lockdown import LockdownClient
 from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
 from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
 from pymobiledevice3.restore.tss import TSSRequest
@@ -55,10 +55,7 @@ class MobileImageMounterService(LockdownService):
     IMAGE_TYPE: ClassVar[Optional[str]] = None
 
     def __init__(self, lockdown: LockdownServiceProvider):
-        if isinstance(lockdown, LockdownClient):
-            super().__init__(lockdown, self.SERVICE_NAME)
-        else:
-            super().__init__(lockdown, self.RSD_SERVICE_NAME)
+        super().__init__(lockdown)
         self._copy_devices_unsupported = False
 
     async def _send_recv(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -84,10 +81,33 @@ class MobileImageMounterService(LockdownService):
         :returns: List of dictionaries, one per mounted image entry.
         :raises MessageNotSupportedError: If the device does not support the ``CopyDevices`` command.
         """
+        response = await self._send_recv({"Command": "CopyDevices"})
         try:
-            return (await self._send_recv({"Command": "CopyDevices"}))["EntryList"]
+            return response["EntryList"]
         except KeyError as e:
-            raise MessageNotSupportedError from e
+            raise MessageNotSupportedError("CopyDevices", response) from e
+
+    async def list_images(self) -> list[dict[str, Any]]:
+        """
+        List the images currently mounted on the device, also on devices without ``CopyDevices``.
+
+        Before iOS 14 the only image is the ``Developer`` one, so it is looked up instead and reported
+        with the fields ``CopyDevices`` gives it (``DiskImageType``, ``IsMounted``, ``ImageSignature``).
+
+        :returns: List of dictionaries, one per mounted image entry.
+        """
+        if not self._copy_devices_unsupported:
+            try:
+                return await self.copy_devices()
+            except MessageNotSupportedError:
+                # see is_image_mounted(): the legacy proxy hangs up after an unknown command
+                self._copy_devices_unsupported = True
+                await self.close()
+        try:
+            signature = await self.lookup_image("Developer")
+        except NotMountedError:
+            return []
+        return [{"DiskImageType": "Developer", "IsMounted": True, "ImageSignature": signature}]
 
     async def lookup_image(self, image_type: str) -> bytes:
         """
@@ -157,11 +177,11 @@ class MobileImageMounterService(LockdownService):
             if error == "UnknownCommand":
                 raise UnsupportedCommandError()
             elif "There is no matching entry" in response.get("DetailedError", ""):
-                raise NotMountedError(response)
+                raise NotMountedError(f"No image is mounted at {mount_path}.")
             elif error == "InternalError":
                 raise InternalError(response)
             else:
-                raise PyMobileDevice3Exception(response)
+                raise PyMobileDevice3Exception(f"The device failed to unmount the image at {mount_path}: {response}")
 
     async def mount_image(self, image_type: str, signature: bytes, extras: Optional[dict[str, Any]] = None) -> None:
         """
@@ -193,8 +213,10 @@ class MobileImageMounterService(LockdownService):
         if status != "Complete":
             # backstop for when the pre-mount check above missed the mounted image
             if "is already mounted" in response.get("DetailedError", ""):
-                raise AlreadyMountedError(response)
-            raise PyMobileDevice3Exception(f"command MountImage failed with: {response}")
+                raise AlreadyMountedError(
+                    f"A {image_type} image is already mounted: {response.get('DetailedError', response)}"
+                )
+            raise PyMobileDevice3Exception(f"The device failed to mount the {image_type} image: {response}")
 
     async def upload_image(self, image_type: str, image: bytes, signature: bytes) -> None:
         """
@@ -219,7 +241,7 @@ class MobileImageMounterService(LockdownService):
         status = result.get("Status")
 
         if status != "ReceiveBytesAck":
-            raise PyMobileDevice3Exception(f"command ReceiveBytes failed with: {result}")
+            raise PyMobileDevice3Exception(f"The device refused to receive the {image_type} image: {result}")
 
         await self.service.sendall(image)
         result = await self.service.recv_plist()
@@ -227,7 +249,7 @@ class MobileImageMounterService(LockdownService):
         status = result.get("Status")
 
         if status != "Complete":
-            raise PyMobileDevice3Exception(f"command ReceiveBytes failed to send bytes with: {result}")
+            raise PyMobileDevice3Exception(f"The device failed to receive the {image_type} image: {result}")
 
     async def query_developer_mode_status(self) -> bool:
         """
@@ -241,7 +263,7 @@ class MobileImageMounterService(LockdownService):
         try:
             return response["DeveloperModeStatus"]
         except KeyError as e:
-            raise MessageNotSupportedError from e
+            raise MessageNotSupportedError("QueryDeveloperModeStatus", response) from e
 
     async def query_nonce(self, personalized_image_type: Optional[str] = None) -> bytes:
         """
@@ -259,7 +281,7 @@ class MobileImageMounterService(LockdownService):
         try:
             return response["PersonalizationNonce"]
         except KeyError as e:
-            raise MessageNotSupportedError from e
+            raise MessageNotSupportedError("QueryNonce", response) from e
 
     async def query_personalization_identifiers(self, image_type: Optional[str] = None) -> dict[str, Any]:
         """
@@ -338,6 +360,16 @@ PERSONALIZED_IMAGE_MIN_VERSION = Version("17.0")
 # from 26.4 (see cryptexd.DDI_CRYPTEX_MIN_VERSION), but that is unverified on a device below 27,
 # while the PersonalizedDMG lists every board those versions run on and keeps working.
 CRYPTEX_IMAGE_MIN_VERSION = Version("27.0")
+
+
+class PersonalizedDdi(str, enum.Enum):
+    """Which iOS 17+ DeveloperDiskImage `auto_mount` installs, overriding its version-based choice."""
+
+    #: The Cryptex1 DDI, installed over ``cryptexd``; needs an RSD tunnel.
+    CRYPTEX = "cryptex"
+    #: The ``PersonalizedDMG``, mounted over the image mounter. Works where the device cannot
+    #: install the cryptex, e.g. a virtual iPhone 27.0 whose sandbox denies cryptexd staging.
+    PERSONALIZED_DMG = "personalized-dmg"
 
 
 class DeveloperDiskImageMounter(MobileImageMounterService):
@@ -473,7 +505,9 @@ async def request_personalization_manifest(
             build_identity = tmp_build_identity
             break
     else:
-        raise NoSuchBuildIdentityError(f"Could not find the manifest for board {board_id} and chip {chip_id}")
+        raise NoSuchBuildIdentityError(
+            f"The image's build manifest has no entry for this device (board {board_id}, chip {chip_id})."
+        )
     manifest = build_identity["Manifest"]
 
     parameters: dict[str, Any] = {
@@ -540,50 +574,46 @@ async def auto_mount_developer(
     before mounting.
 
     :param lockdown: Lockdown service provider for the target device.
-    :param xcode: Path to the Xcode app bundle to source images from. Defaults to
-        ``/Applications/Xcode.app`` or a created ``Xcode.app`` under the home folder.
+    :param xcode: Path to the Xcode app bundle to source images from, and to download a missing one
+        into. Defaults to ``/Applications/Xcode.app`` for an image it ships, and to a cache under the
+        home folder for one it does not (an installed Xcode is not ours to write into).
     :param version: iOS version (``major.minor``) to select the image for. Defaults to the device's
         product version.
     :raises AlreadyMountedError: If a Developer image is already mounted.
     :raises DeveloperDiskImageNotFoundError: If no matching image is available in the repository.
     """
-    if xcode is None:
-        # avoid "default"-ing this option, because Windows and Linux won't have this path
-        xcode_path = Path("/Applications/Xcode.app")
-        if not (xcode_path.exists()):
-            xcode_path = get_home_folder() / "Xcode.app"
-            xcode_path.mkdir(parents=True, exist_ok=True)
-        xcode = str(xcode_path)
-
-    image_mounter = DeveloperDiskImageMounter(lockdown=lockdown)
-    if await image_mounter.is_image_mounted("Developer"):
-        raise AlreadyMountedError()
-
     if version is None:
         product_version = Version(lockdown.product_version)
         version = f"{product_version.major}.{product_version.minor}"
-    image_dir = f"{xcode}/Contents/Developer/Platforms/iPhoneOS.platform/DeviceSupport/{version}"
-    image_path = f"{image_dir}/DeveloperDiskImage.dmg"
-    signature = f"{image_path}.signature"
-    developer_disk_image_dir = Path(image_path).parent
+    if xcode is not None:
+        image_path = _developer_disk_image_path(Path(xcode), version)
+    else:
+        # avoid "default"-ing this option, because Windows and Linux won't have this path
+        image_path = _developer_disk_image_path(Path("/Applications/Xcode.app"), version)
+        if not image_path.exists():
+            image_path = _developer_disk_image_path(get_home_folder() / "Xcode.app", version)
+    signature = image_path.with_name(f"{image_path.name}.signature")
 
-    image_path = Path(image_path)
-    signature = Path(signature)
+    async with DeveloperDiskImageMounter(lockdown=lockdown) as image_mounter:
+        if await image_mounter.is_image_mounted("Developer"):
+            raise AlreadyMountedError()
+        if not image_path.exists():
+            _download_developer_disk_image(version, image_path, signature)
+        await image_mounter.mount(image_path, signature)
 
-    if not image_path.exists():
-        # download the DeveloperDiskImage from our repository
-        repo = DeveloperDiskImageRepository.create()
-        developer_disk_image = repo.get_developer_disk_image(version)
 
-        if developer_disk_image is None:
-            raise DeveloperDiskImageNotFoundError()
+def _developer_disk_image_path(xcode: Path, version: str) -> Path:
+    return xcode / "Contents/Developer/Platforms/iPhoneOS.platform/DeviceSupport" / version / "DeveloperDiskImage.dmg"
 
-        # write it filesystem
-        developer_disk_image_dir.mkdir(exist_ok=True, parents=True)
-        image_path.write_bytes(developer_disk_image.image)
-        signature.write_bytes(developer_disk_image.signature)
 
-    await image_mounter.mount(image_path, signature)
+def _download_developer_disk_image(version: str, image_path: Path, signature: Path) -> None:
+    """Download the DeveloperDiskImage for ``version`` from our repository to ``image_path``."""
+    developer_disk_image = DeveloperDiskImageRepository.create().get_developer_disk_image(version)
+    if developer_disk_image is None:
+        raise DeveloperDiskImageNotFoundError()
+    image_path.parent.mkdir(exist_ok=True, parents=True)
+    image_path.write_bytes(developer_disk_image.image)
+    signature.write_bytes(developer_disk_image.signature)
 
 
 def fetch_personalized_ddi() -> tuple[Path, Path, Path]:
@@ -643,7 +673,7 @@ def uses_cryptex_image(lockdown: LockdownServiceProvider) -> bool:
     return True
 
 
-async def auto_mount_personalized(lockdown: LockdownServiceProvider) -> None:
+async def auto_mount_personalized(lockdown: LockdownServiceProvider, image: Optional[PersonalizedDdi] = None) -> None:
     """
     Download (if needed) and mount the Personalized Developer Disk Image.
 
@@ -652,17 +682,23 @@ async def auto_mount_personalized(lockdown: LockdownServiceProvider) -> None:
     be personalized for devices newer than the DDI itself. From `CRYPTEX_IMAGE_MIN_VERSION` the
     cryptex is the only choice, so plain lockdown is refused with `RSDRequiredError` (which the CLI
     answers by retrying over a tunnel). Below it -- or where `uses_cryptex_image` otherwise rules
-    the cryptex out -- mounts the ``PersonalizedDMG`` over the image mounter.
+    the cryptex out -- mounts the ``PersonalizedDMG`` over the image mounter. `image` overrides
+    that choice.
 
     :param lockdown: Lockdown service provider for the target device.
-    :raises RSDRequiredError: on `CRYPTEX_IMAGE_MIN_VERSION` and later without an RSD tunnel.
+    :param image: forces this image instead of choosing one by iOS version.
+    :raises RSDRequiredError: when the cryptex is to be installed without an RSD tunnel.
     """
-    if not isinstance(lockdown, RemoteServiceDiscoveryService) and (
-        Version(lockdown.product_version) >= CRYPTEX_IMAGE_MIN_VERSION
-    ):
+    if image is None:
+        if not isinstance(lockdown, RemoteServiceDiscoveryService) and (
+            Version(lockdown.product_version) >= CRYPTEX_IMAGE_MIN_VERSION
+        ):
+            raise RSDRequiredError(lockdown.udid, lockdown.product_version)
+        image = PersonalizedDdi.CRYPTEX if uses_cryptex_image(lockdown) else PersonalizedDdi.PERSONALIZED_DMG
+    elif image == PersonalizedDdi.CRYPTEX and not isinstance(lockdown, RemoteServiceDiscoveryService):
         raise RSDRequiredError(lockdown.udid, lockdown.product_version)
 
-    if uses_cryptex_image(lockdown):
+    if image == PersonalizedDdi.CRYPTEX:
         from pymobiledevice3.services.cryptexd import CryptexdService
 
         async with PersonalizedImageMounter(lockdown=lockdown) as mounter:
@@ -670,8 +706,9 @@ async def auto_mount_personalized(lockdown: LockdownServiceProvider) -> None:
         await CryptexdService(cast(RemoteServiceDiscoveryService, lockdown)).auto_install_ddi()
         return
 
-    image, build_manifest, trustcache = fetch_personalized_ddi()
-    await PersonalizedImageMounter(lockdown=lockdown).mount(image, build_manifest, trustcache)
+    dmg, build_manifest, trustcache = fetch_personalized_ddi()
+    async with PersonalizedImageMounter(lockdown=lockdown) as mounter:
+        await mounter.mount(dmg, build_manifest, trustcache)
 
 
 def uses_personalized_image(lockdown: LockdownServiceProvider) -> bool:
@@ -694,7 +731,10 @@ def image_type_for_device(lockdown: LockdownServiceProvider) -> str:
 
 
 async def auto_mount(
-    lockdown: LockdownServiceProvider, xcode: Optional[str] = None, version: Optional[str] = None
+    lockdown: LockdownServiceProvider,
+    xcode: Optional[str] = None,
+    version: Optional[str] = None,
+    image: Optional[PersonalizedDdi] = None,
 ) -> None:
     """
     Auto-mount the appropriate Developer Disk Image for the device's iOS version.
@@ -706,8 +746,12 @@ async def auto_mount(
     :param lockdown: Lockdown service provider for the target device.
     :param xcode: Path to the Xcode app bundle, forwarded to `auto_mount_developer`.
     :param version: iOS version override, forwarded to `auto_mount_developer`.
+    :param image: forces this iOS 17+ image, forwarded to `auto_mount_personalized`.
+    :raises ValueError: if `image` is given for a device below iOS 17.0.
     """
     if uses_personalized_image(lockdown):
-        await auto_mount_personalized(lockdown)
+        await auto_mount_personalized(lockdown, image=image)
+    elif image is not None:
+        raise ValueError(f"{image.value} is an iOS {PERSONALIZED_IMAGE_MIN_VERSION}+ image")
     else:
         await auto_mount_developer(lockdown, xcode=xcode, version=version)

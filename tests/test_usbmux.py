@@ -138,7 +138,7 @@ async def test_binary_mux_listen_and_device_updates() -> None:
         assert mux.devices == []
 
         server.sendall(_packet(UsbmuxdMessageType.RESULT, struct.pack("<I", UsbmuxdResult.BADDEV), tag=2))
-        with pytest.raises(BadDevError, match="LISTEN failed: error BADDEV"):
+        with pytest.raises(BadDevError, match="usbmuxd rejected the LISTEN request: BADDEV"):
             await mux.listen()
     finally:
         client.close()
@@ -157,6 +157,24 @@ async def test_plist_mux_roundtrip() -> None:
         assert request.header == UsbmuxdHeader(UsbmuxdVersion.PLIST, UsbmuxdMessageType.PLIST, 1)
         assert isinstance(request.data, bytes)
         assert plistlib.loads(request.data)["MessageType"] == "ReadBUID"
+    finally:
+        client.close()
+        server.close()
+
+
+async def test_plist_mux_delete_pair_record() -> None:
+    client, server = socket.socketpair()
+    client.setblocking(False)
+    try:
+        mux = PlistMuxConnection(client)
+        reply = plistlib.dumps({"MessageType": "Result", "Number": 0})
+        server.sendall(_packet(UsbmuxdMessageType.PLIST, reply, version=1, tag=1))
+        await mux.delete_pair_record("00008110-001234567890001E")
+        request = parse_usbmuxd_response(server.recv(4096))
+        assert isinstance(request.data, bytes)
+        message = plistlib.loads(request.data)
+        assert message["MessageType"] == "DeletePairRecord"
+        assert message["PairRecordID"] == "00008110-001234567890001E"
     finally:
         client.close()
         server.close()

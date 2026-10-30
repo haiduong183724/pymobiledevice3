@@ -5,7 +5,7 @@ import os
 import plistlib
 import typing
 
-from pymobiledevice3.exceptions import ConnectionFailedError, NotConnectedError, PyMobileDevice3Exception
+from pymobiledevice3.exceptions import ConnectionFailedError, NotConnectedError, ProtocolError
 from pymobiledevice3.progress import BYTES_UNIT, ProgressBar
 from pymobiledevice3.service_connection import ServiceConnection
 from pymobiledevice3.utils import current_task_name
@@ -42,7 +42,7 @@ class ASRClient:
         :raises NotConnectedError: if accessed before ``connect()`` has run.
         """
         if self._service is None:
-            raise NotConnectedError("ASRClient is not connected; call connect() first")
+            raise NotConnectedError("ASRClient is not connected. Call connect() first.")
         return self._service
 
     async def connect(self, port: int = DEFAULT_ASR_SYNC_PORT) -> None:
@@ -59,7 +59,6 @@ class ASRClient:
                     raise
                 self.logger.debug(f"ASR connection failed, retrying ({attempt}/{ASR_CONNECT_ATTEMPTS})")
                 await asyncio.sleep(ASR_CONNECT_RETRY_DELAY)
-        await self.service.start()
 
         # receive Initiate command message
         data = await self.recv_plist()
@@ -67,7 +66,7 @@ class ASRClient:
 
         command = data.get("Command")
         if command != "Initiate":
-            raise PyMobileDevice3Exception(f"invalid command received: {command}")
+            raise ProtocolError(f"ASR did not start with the expected Initiate command: {command}")
 
         self.checksum_chunks = data.get("Checksum Chunks", False)
         self.logger.debug(f"Checksum Chunks: {self.checksum_chunks}")
@@ -95,11 +94,7 @@ class ASRClient:
 
         await self.send_buffer(oob_data)
 
-    async def perform_validation(self, filesystem: typing.IO[bytes]) -> None:
-        filesystem.seek(0, os.SEEK_END)
-        length = filesystem.tell()
-        filesystem.seek(0, os.SEEK_SET)
-
+    async def send_validation_packet_info(self, length: int) -> None:
         payload_info = {
             "Port": 1,
             "Size": length,
@@ -118,6 +113,14 @@ class ASRClient:
 
         await self.send_plist(packet_info)
 
+    async def perform_validation(self, filesystem: typing.IO[bytes]) -> None:
+        filesystem.seek(0, os.SEEK_END)
+        length = filesystem.tell()
+        filesystem.seek(0, os.SEEK_SET)
+
+        # Expected by the device after every Initiate
+        await self.send_validation_packet_info(length)
+
         while True:
             packet = await self.recv_plist()
             self.logger.debug(f"perform_validation: {packet}")
@@ -126,11 +129,19 @@ class ASRClient:
             if command == "Payload":
                 break
 
+            elif command == "Initiate":
+                # First seen in iBridgeOS 9.0: a second Initiate may switch Checksum Chunks on
+                checksum_chunks = packet.get("Checksum Chunks")
+                if isinstance(checksum_chunks, bool):
+                    self.checksum_chunks = checksum_chunks
+                self.logger.debug(f"Checksum Chunks: {self.checksum_chunks}")
+                await self.send_validation_packet_info(length)
+
             elif command == "OOBData":
                 await self.handle_oob_data_request(packet, filesystem)
 
             else:
-                raise PyMobileDevice3Exception(f"unknown packet: {packet}")
+                raise ProtocolError(f"ASR sent an unexpected packet while validating the filesystem: {packet}")
 
     async def send_payload(self, filesystem: typing.IO[bytes]) -> None:
         filesystem.seek(0, os.SEEK_END)

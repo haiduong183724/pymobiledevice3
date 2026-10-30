@@ -12,6 +12,7 @@ from pymobiledevice3.exceptions import (
     ConnectionFailedError,
     ConnectionTerminatedError,
     NoDeviceConnectedError,
+    ProtocolError,
     PyMobileDevice3Exception,
 )
 from pymobiledevice3.service_connection import ServiceConnection
@@ -65,7 +66,7 @@ class FDRClient:
             )
         else:
             if conn_port is None:
-                raise PyMobileDevice3Exception("FDR connection port is unavailable")
+                raise PyMobileDevice3Exception("The device has not reported an FDR connection port yet.")
             service = await ServiceConnection.create_using_usbmux(device.serial, conn_port, connection_type="USB")
 
         client = cls(service, device.serial)
@@ -112,7 +113,7 @@ class FDRClient:
         identifier = reply["Identifier"]
 
         if cmd != "HelloConn":
-            raise PyMobileDevice3Exception("Did not receive HelloConn reply...")
+            raise ProtocolError(f"The device did not answer the FDR handshake with HelloConn: {cmd}")
         if identifier:
             logger.debug(f"got device identifier: {identifier}")
 
@@ -229,9 +230,11 @@ async def run_fdr_listener(type_: fdr_type, udid: Optional[str] = None) -> None:
     except GeneratorExit:
         # Coroutine finalization cannot perform async cleanup (no await allowed).
         closing_via_generator_exit = True
-        if client is not None and client.service.socket is not None:
-            with contextlib.suppress(Exception):
-                client.service.socket.close()
+        if client is not None:
+            # StreamWriter.close() starts closing the transport without awaiting; on a loop that is
+            # already closed it raises, and the transport closes its socket when collected.
+            with contextlib.suppress(RuntimeError):
+                client.service.writer.close()
         raise
     except ConnectionTerminatedError:
         pass

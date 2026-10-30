@@ -15,7 +15,6 @@ from pymobiledevice3.exceptions import (
     RemoteAutomationNotEnabledError,
     WebInspectorNotEnabledError,
 )
-from pymobiledevice3.lockdown import LockdownClient
 from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
 from pymobiledevice3.services.lockdown_service import LockdownService
 from pymobiledevice3.services.notification_proxy import NotificationProxyService
@@ -190,7 +189,7 @@ class WebinspectorService(LockdownService):
     RSD_SERVICE_NAME = "com.apple.webinspector.shim.remote"
 
     def __init__(self, lockdown: LockdownServiceProvider) -> None:
-        super().__init__(lockdown, self.SERVICE_NAME if isinstance(lockdown, LockdownClient) else self.RSD_SERVICE_NAME)
+        super().__init__(lockdown)
         self.connection_id = str(uuid.uuid4()).upper()
         self.state: Optional[str] = None
         self.connected_application: dict[str, Application] = {}
@@ -300,9 +299,9 @@ class WebinspectorService(LockdownService):
 
         * Web Inspector is disabled on the device.
         * The gate it puts on consecutive sessions has not elapsed: a new session is admitted only
-          about ten seconds after the previous one started, a hair longer than
-          DEFAULT_SSL_HANDSHAKE_TIMEOUT. Reattaching right after a session ended - restarting the
-          CDP bridge, or opening an automation session once inspection is done - hits this.
+          about ten seconds after the previous one started. DEFAULT_SSL_HANDSHAKE_TIMEOUT now
+          outlasts that wait, so a reattach right after a session ended - restarting the CDP bridge,
+          or opening an automation session once inspection is done - normally just waits it out.
         * It is not up yet because the device is still booting. `--reconnect` re-runs a command the
           moment lockdownd answers again, which is seconds before webinspectord serves anything.
 
@@ -768,13 +767,6 @@ class WebinspectorService(LockdownService):
             await self._service.send_plist({"__selector": selector, "__argument": args})
         except (ConnectionError, ConnectionTerminatedError, OSError, EOFError) as error:
             self._note_connection_lost(error)
-
-    def _page_by_automation_session(self, session_id: str) -> Page:
-        for app_id in self.application_pages:
-            for page in self.application_pages[app_id]:
-                if page.type_ == WirTypes.AUTOMATION and page.automation_session_id == session_id:
-                    return page
-        raise KeyError(f"Automation session with id {session_id} not found")
 
     async def _wait_for_page(self, session_id: str) -> Page:
         while True:

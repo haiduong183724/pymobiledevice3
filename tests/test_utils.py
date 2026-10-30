@@ -1,11 +1,26 @@
+import asyncio
 import inspect
 import os
+import signal
+import threading
+from collections.abc import Generator
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import Any
 
 import pytest
+import requests
 from bytestruct import BinaryParseError
 
-from pymobiledevice3.utils import bytes_to_uint, hexdump, path_to_str, str_to_path
+from pymobiledevice3.utils import (
+    bytes_to_uint,
+    cancel_on_sigint,
+    file_download,
+    hexdump,
+    path_to_str,
+    sigint_handler,
+    str_to_path,
+)
 
 
 def test_hexdump_formats_full_and_partial_lines() -> None:
@@ -84,3 +99,115 @@ def test_bytes_to_uint_reads_the_widest_integer_that_fits(data: bytes, expected:
 def test_bytes_to_uint_of_nothing() -> None:
     with pytest.raises(BinaryParseError):
         bytes_to_uint(b"")
+
+
+async def test_cancel_on_sigint_cancels_the_task_then_raises() -> None:
+    previous = signal.getsignal(signal.SIGINT)
+    task = asyncio.ensure_future(asyncio.sleep(10))
+    with cancel_on_sigint(task) as interrupted:
+        assert not interrupted()
+        signal.raise_signal(signal.SIGINT)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert interrupted()
+        # Once the task is done, Ctrl-C is a KeyboardInterrupt again.
+        with pytest.raises(KeyboardInterrupt):
+            signal.raise_signal(signal.SIGINT)
+    assert signal.getsignal(signal.SIGINT) is previous
+
+
+async def test_cancel_on_sigint_leaves_an_ignored_sigint_alone() -> None:
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        task = asyncio.ensure_future(asyncio.sleep(0))
+        with cancel_on_sigint(task):
+            assert signal.getsignal(signal.SIGINT) is signal.SIG_IGN
+        await task
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+async def test_sigint_handler_takes_over_inside_cancel_on_sigint() -> None:
+    task = asyncio.ensure_future(asyncio.sleep(10))
+    with cancel_on_sigint(task) as interrupted:
+        handler = signal.getsignal(signal.SIGINT)
+        with sigint_handler(signal.default_int_handler), pytest.raises(KeyboardInterrupt):
+            signal.raise_signal(signal.SIGINT)
+        assert signal.getsignal(signal.SIGINT) is handler
+        assert not interrupted()
+    task.cancel()
+
+
+BODY = b"payload" * 1000
+
+
+class _ServeOrFail(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path == "/missing.ipsw":
+            self.send_error(404)
+            return
+        start = 0
+        range_header = self.headers.get("Range")
+        if range_header and self.path != "/no-ranges.ipsw":
+            start = int(range_header.removeprefix("bytes=").rstrip("-"))
+            if start >= len(BODY):
+                self.send_error(416)
+                return
+            self.send_response(206)
+        else:
+            self.send_response(200)
+        self.send_header("Content-Length", str(len(BODY) - start))
+        self.end_headers()
+        self.wfile.write(BODY[start:])
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - matches the overridden signature
+        pass
+
+
+@pytest.fixture
+def http_url() -> Generator[str, None, None]:
+    server = HTTPServer(("127.0.0.1", 0), _ServeOrFail)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+    server.server_close()
+
+
+def test_file_download_writes_the_body(tmp_path: Path, http_url: str) -> None:
+    outfile = tmp_path / "fw.ipsw"
+    file_download(f"{http_url}/fw.ipsw", outfile)
+    assert outfile.read_bytes() == BODY
+
+
+def test_file_download_does_not_save_an_error_page(tmp_path: Path, http_url: str) -> None:
+    outfile = tmp_path / "missing.ipsw"
+    with pytest.raises(requests.HTTPError):
+        file_download(f"{http_url}/missing.ipsw", outfile)
+    assert not outfile.exists()
+
+
+@pytest.mark.parametrize("path", ["/fw.ipsw", "/no-ranges.ipsw"], ids=["range", "server-ignores-range"])
+def test_file_download_resumes_a_partial_file(tmp_path: Path, http_url: str, path: str) -> None:
+    outfile = tmp_path / "fw.ipsw.part"
+    outfile.write_bytes(BODY[:1234])
+
+    assert file_download(f"{http_url}{path}", outfile, resume=True)
+    assert outfile.read_bytes() == BODY
+
+
+def test_file_download_resume_of_a_complete_file_is_a_no_op(tmp_path: Path, http_url: str) -> None:
+    outfile = tmp_path / "fw.ipsw.part"
+    outfile.write_bytes(BODY)
+
+    assert file_download(f"{http_url}/fw.ipsw", outfile, resume=True)
+    assert outfile.read_bytes() == BODY
+
+
+def test_file_download_stops_when_asked_and_keeps_what_it_wrote(tmp_path: Path, http_url: str) -> None:
+    outfile = tmp_path / "fw.ipsw.part"
+    stop = threading.Event()
+    stop.set()
+
+    assert not file_download(f"{http_url}/fw.ipsw", outfile, stop=stop)
+    assert outfile.exists()

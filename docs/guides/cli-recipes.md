@@ -44,6 +44,9 @@ pymobiledevice3 diagnostics restart
 # Pull crash reports
 pymobiledevice3 crash pull /path/to/crashes
 
+# Remove only matching crash reports, without copying them
+pymobiledevice3 crash clear --match '^MobileSafari'
+
 # Show the process list (diagnosticsd API; no developer tunnel required)
 pymobiledevice3 processes ps
 
@@ -80,8 +83,19 @@ pymobiledevice3 apps list
 # Query specific app bundle IDs
 pymobiledevice3 apps query BUNDLE_ID1 BUNDLE_ID2
 
+# Dump contacts / calendars / Safari bookmarks / mail accounts without a backup
+pymobiledevice3 mobilesync dump contacts
+
+# Add or modify records (keyed by record id from `dump`; unknown ids add new records), then delete one
+# Use a plist instead of JSON for records with dates, such as calendar events
+pymobiledevice3 mobilesync push contacts changes.json
+pymobiledevice3 mobilesync delete contacts RECORD_ID
+
 # Full backup
 pymobiledevice3 backup2 backup --full DIRECTORY
+
+# Turn iCloud Backup on / off (needs a signed-in iCloud account)
+pymobiledevice3 backup2 cloud on
 
 # Preserve only selected backup payloads
 pymobiledevice3 backup2 backup --only messages DIRECTORY
@@ -118,6 +132,28 @@ pymobiledevice3 profile install my.mobileconfig
 
 # Remove a profile by its identifier/name
 pymobiledevice3 profile remove com.example.profile
+```
+
+Supervised devices only: these commands escalate with the supervision identity passed as
+`--keybag` (a PEM holding the supervisor certificate and private key, e.g. from
+`profile create-keybag`).
+
+```shell
+# Save the passcode unlock token (the device must have no passcode yet); written with mode 0600
+pymobiledevice3 profile request-unlock-token --keybag keybag.pem unlock-token.bin
+
+# Later: remove the passcode without knowing it; the device then drops the pairing, so re-pair
+pymobiledevice3 profile clear-passcode --keybag keybag.pem unlock-token.bin
+pymobiledevice3 lockdown pair-supervised keybag.pem
+
+# Clear the Screen Time passcode (iOS 27.2 rejects it device-side)
+pymobiledevice3 profile clear-restrictions-password --keybag keybag.pem
+
+# Security status as JSON; PasscodePresent reliably tells whether a passcode is set
+pymobiledevice3 profile security-info --keybag keybag.pem
+
+# Set the wallpaper (--screen lock|home|both; iOS 16+ may apply it to both regardless)
+pymobiledevice3 profile set-wallpaper --keybag keybag.pem wallpaper.png --screen both
 ```
 
 ## Cryptexes (iOS 17+, RSD tunnel)
@@ -287,6 +323,9 @@ pymobiledevice3 restore update -i https://example.com/firmware.ipsw
 # Enable Developer Mode
 pymobiledevice3 amfi enable-developer-mode
 
+# Trust the developer app signer of an installed provisioning profile (UUID from `provision list`)
+pymobiledevice3 amfi trust-app-signer <profile-uuid>
+
 # Auto-mount DeveloperDiskImage
 pymobiledevice3 mounter auto-mount
 ```
@@ -298,6 +337,11 @@ pymobiledevice3 mounter auto-mount
 | < 17.0 | the classic `DeveloperDiskImage.dmg` for that version, over the image mounter |
 | 17.0 - 26.x | the `PersonalizedDMG` over the image mounter |
 | 27.0+ | the Cryptex1 DDI over `cryptexd` |
+
+On iOS 17+, `--image cryptex|personalized-dmg` overrides that choice. For example, a device
+whose cryptexd cannot install the cryptex (`syslog live -m cryptexd` shows `staging failed`)
+can still mount the `PersonalizedDMG` with `mounter auto-mount --image personalized-dmg`,
+as long as the DDI's build manifest lists its board.
 
 !!! note "Newer devices (e.g. the iPhone 18 series) only work with the Cryptex1 DDI"
 
@@ -401,10 +445,10 @@ pymobiledevice3 developer dvt ls PATH
 pymobiledevice3 developer dvt launch com.apple.mobilesafari
 
 # Live KDebug parsing (strace-like). Unfiltered, the device emits events faster than they can
-# be parsed, so output skips ahead (with a warning on stderr) whenever it falls 2s behind;
-# --bsc / --class-filters / --subclass-filters filter on the device (by subclass at most), and
-# --no-skip-behind keeps every event at the cost of falling ever further behind. While apps launch,
-# --bsc keeps up over any tunnel
+# be parsed, so output fails once it falls --max-lag (2s) behind, or skips ahead (with a warning on
+# stderr) with --skip-behind; --bsc / --class-filters / --subclass-filters filter on the device (by
+# subclass at most). On exit it prints how many events were read, dropped by the device and
+# skipped. While apps launch, --bsc keeps up over any tunnel
 pymobiledevice3 developer dvt core-profile-session parse-live
 pymobiledevice3 developer dvt core-profile-session parse-live --bsc
 
@@ -537,6 +581,13 @@ pymobiledevice3 developer core-device universal-hid-service tap -- 32768 32768
 
 # Drag from near the top to near the bottom (e.g. pull-down)
 pymobiledevice3 developer core-device universal-hid-service drag -- 32768 5000 32768 60000
+
+# Multi-finger (up to 5): two-finger tap at X Y pairs
+pymobiledevice3 developer core-device universal-hid-service multi-tap -- 26000 30000 40000 30000
+
+# Multi-finger drag, X1 Y1 X2 Y2 (start, end) per finger: apart = zoom in,
+# together = pinch, parallel = multi-finger swipe
+pymobiledevice3 developer core-device universal-hid-service multi-drag -- 28000 28000 12000 20000 37536 32000 53536 40000
 
 # Pure pointer-motion gesture (moves cursor without registering a contact)
 pymobiledevice3 developer core-device universal-hid-service swipe -- 100 400 700 400

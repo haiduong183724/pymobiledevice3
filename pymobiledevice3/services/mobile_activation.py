@@ -3,9 +3,8 @@ import dataclasses
 import logging
 import plistlib
 import xml.etree.ElementTree as ET
-from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, cast
 
 import questionary
 import requests
@@ -28,14 +27,6 @@ DEFAULT_HEADERS = {
 
 ACTIVATION_REQUESTS_SUBDIR = Path("offline_requests")
 NONCE_CYCLE_INTERVAL = 60 * 5
-
-
-@asynccontextmanager
-async def _aclosing(resource: Any):
-    try:
-        yield resource
-    finally:
-        await resource.aclose()
 
 
 @dataclasses.dataclass
@@ -111,7 +102,7 @@ class MobileActivationService:
         footer = root.find("page/tableView/section/footer")
         server_info_node = root.find("serverInfo")
         if navigation_bar is None or footer is None or server_info_node is None:
-            raise MobileActivationException("Activation server response is invalid")
+            raise MobileActivationException("Could not parse the page sent by Apple's activation server.")
         title = navigation_bar.get("title")
         description = footer.text
         fields: list[Field] = []
@@ -193,7 +184,9 @@ class MobileActivationService:
                         self.logger.warning(f"Unable to get {k} from lockdownd")
                         if k == "MEID" and has_meid:
                             # Something is wrong if both IMEI & MEID is missing
-                            raise MobileActivationException("Unable to obtain both IMEI and MEID")
+                            raise MobileActivationException(
+                                "Could not read either the IMEI or the MEID from the device."
+                            )
 
                     # Either IMEI or MEID, or both
                     if k == "IMEI":
@@ -205,11 +198,11 @@ class MobileActivationService:
 
         if content_type == "application/x-buddyml":
             if skip_apple_id_query:
-                raise MobileActivationException("Device is iCloud locked")
+                raise MobileActivationException("The device is iCloud locked (Activation Lock).")
             try:
                 activation_form = self._get_activation_form_from_response(content.decode())
             except Exception as e:
-                raise MobileActivationException("Activation server response is invalid") from e
+                raise MobileActivationException("Could not parse the page sent by Apple's activation server.") from e
             else:
                 typer.secho(activation_form.title, bold=True)
                 typer.secho(activation_form.description)
@@ -248,7 +241,7 @@ class MobileActivationService:
             assert isinstance(self.lockdown, LockdownClient)
             return await self.lockdown._request("Deactivate")
 
-    async def create_activation_session_info(self):
+    async def create_activation_session_info(self) -> dict[str, Any]:
         """
         Request the device's session-based activation handshake info.
 
@@ -260,10 +253,10 @@ class MobileActivationService:
         response = await self.send_command("CreateTunnel1SessionInfoRequest")
         error = response.get("Error")
         if error is not None:
-            raise MobileActivationException(f"Mobile activation can not be done due to: {response}")
-        return response["Value"]
+            raise MobileActivationException(f"The device refused to create an activation session: {response}")
+        return cast(dict[str, Any], response["Value"])
 
-    async def create_activation_info_with_session(self, handshake_response: Any):
+    async def create_activation_info_with_session(self, handshake_response: Any) -> dict[str, Any]:
         """
         Build the device's activation info from a completed DRM handshake.
 
@@ -277,8 +270,8 @@ class MobileActivationService:
         response = await self.send_command("CreateTunnel1ActivationInfoRequest", handshake_response)
         error = response.get("Error")
         if error is not None:
-            raise MobileActivationException(f"Mobile activation can not be done due to: {response}")
-        return response["Value"]
+            raise MobileActivationException(f"The device refused to create its activation info: {response}")
+        return cast(dict[str, Any], response["Value"])
 
     async def activate_with_lockdown(self, activation_record: bytes):
         """
@@ -296,7 +289,7 @@ class MobileActivationService:
         if node is None:
             node = record.get("device-activation")
         if node is None:
-            raise MobileActivationException("Activation record received is invalid")
+            raise MobileActivationException("The activation record from Apple's server has no device activation entry.")
 
         assert isinstance(self.lockdown, LockdownClient)
         await self.lockdown._request("Activate", {"ActivationRecord": node.get("activation-record")})
@@ -319,7 +312,7 @@ class MobileActivationService:
         }
         if headers:
             data["ActivationResponseHeaders"] = dict(headers)
-        async with _aclosing(await self.lockdown.start_lockdown_service(self.SERVICE_NAME)) as service:
+        async with await self.lockdown.start_lockdown_service(self.SERVICE_NAME) as service:
             return await service.send_recv_plist(data)
 
     async def send_command(self, command: str, value: str = ""):
@@ -336,7 +329,7 @@ class MobileActivationService:
         data = {"Command": command}
         if value:
             data["Value"] = value
-        async with _aclosing(await self.lockdown.start_lockdown_service(self.SERVICE_NAME)) as service:
+        async with await self.lockdown.start_lockdown_service(self.SERVICE_NAME) as service:
             return await service.send_recv_plist(data)
 
     def post(

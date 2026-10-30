@@ -5,7 +5,7 @@ import plistlib
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime
+from ssl import SSLContext
 from typing import Any, Callable, Optional, Union, cast
 
 from pymobiledevice3.bonjour import DEFAULT_BONJOUR_TIMEOUT, browse_remoted
@@ -16,7 +16,8 @@ from pymobiledevice3.exceptions import (
     NoDeviceConnectedError,
     NotConnectedError,
     NotPairedError,
-    PyMobileDevice3Exception,
+    ProtocolError,
+    RemoteXPCHandshakeTimeoutError,
     StartServiceError,
 )
 from pymobiledevice3.lockdown import LockdownClient, create_using_remote
@@ -36,6 +37,10 @@ class RSDDevice:
 
 # from remoted ([RSDRemoteNCMDeviceDevice createPortListener])
 RSD_PORT = 58783
+
+#: How long the device gets to send its peer info after our device handshake. It is the first
+#: multi-KB reply on the connection, so a tunnel that loses large packets stalls exactly here.
+PEER_INFO_TIMEOUT = 10
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +177,7 @@ class RemoteServiceDiscoveryService(LockdownServiceProvider):
     def _require_peer_info(self) -> dict[str, Any]:
         """Return the handshake ``peer_info``, raising if the RSD has not been connected yet."""
         if self.peer_info is None:
-            raise NotConnectedError("RSD is not connected; call connect() first")
+            raise NotConnectedError("The RSD connection is not open; call connect() first.")
         return self.peer_info
 
     @property
@@ -198,107 +203,8 @@ class RemoteServiceDiscoveryService(LockdownServiceProvider):
     def _lockdown(self) -> LockdownClient:
         """Return the remote lockdown client, raising if the device offers no lockdown service."""
         if self.lockdown is None:
-            raise InvalidServiceError("device does not offer a lockdown service", self.udid, self.product_version)
+            raise InvalidServiceError("The device does not offer a lockdown service.", self.udid, self.product_version)
         return self.lockdown
-
-    async def get_developer_mode_status(self) -> bool:
-        """Get whether Developer Mode is enabled, via the remote lockdown service
-        (see ``LockdownClient.get_developer_mode_status``)."""
-        return await self._lockdown.get_developer_mode_status()
-
-    async def get_date(self) -> datetime:
-        """Get the device's current date and time, via the remote lockdown service
-        (see ``LockdownClient.get_date``)."""
-        return await self._lockdown.get_date()
-
-    async def set_language(self, language: str) -> None:
-        """Set the device's language, via the remote lockdown service (see ``LockdownClient.set_language``).
-
-        :param language: The language code to set (e.g. ``"en"``).
-        """
-        await self._lockdown.set_language(language)
-
-    async def get_language(self) -> str:
-        """Get the device's language, via the remote lockdown service (see ``LockdownClient.get_language``)."""
-        return await self._lockdown.get_language()
-
-    async def set_locale(self, locale: str) -> None:
-        """Set the device's locale, via the remote lockdown service (see ``LockdownClient.set_locale``).
-
-        :param locale: The locale string to set (e.g. ``"en_US"``).
-        """
-        await self._lockdown.set_locale(locale)
-
-    async def get_locale(self) -> str:
-        """Get the device's locale, via the remote lockdown service (see ``LockdownClient.get_locale``)."""
-        return await self._lockdown.get_locale()
-
-    async def set_assistive_touch(self, value: bool) -> None:
-        """Enable or disable AssistiveTouch, via the remote lockdown service
-        (see ``LockdownClient.set_assistive_touch``).
-
-        :param value: True to enable, False to disable.
-        """
-        await self._lockdown.set_assistive_touch(value)
-
-    async def get_assistive_touch(self) -> bool:
-        """Get whether AssistiveTouch is enabled, via the remote lockdown service
-        (see ``LockdownClient.get_assistive_touch``)."""
-        return await self._lockdown.get_assistive_touch()
-
-    async def set_voice_over(self, value: bool) -> None:
-        """Enable or disable VoiceOver, via the remote lockdown service
-        (see ``LockdownClient.set_voice_over``).
-
-        :param value: True to enable, False to disable.
-        """
-        await self._lockdown.set_voice_over(value)
-
-    async def get_voice_over(self) -> bool:
-        """Get whether VoiceOver is enabled, via the remote lockdown service
-        (see ``LockdownClient.get_voice_over``)."""
-        return await self._lockdown.get_voice_over()
-
-    async def set_invert_display(self, value: bool) -> None:
-        """Enable or disable display color inversion, via the remote lockdown service
-        (see ``LockdownClient.set_invert_display``).
-
-        :param value: True to enable, False to disable.
-        """
-        await self._lockdown.set_invert_display(value)
-
-    async def get_invert_display(self) -> bool:
-        """Get whether display color inversion is enabled, via the remote lockdown service
-        (see ``LockdownClient.get_invert_display``)."""
-        return await self._lockdown.get_invert_display()
-
-    async def set_enable_wifi_connections(self, value: bool) -> None:
-        """Enable or disable Wi-Fi lockdown connections, via the remote lockdown service
-        (see ``LockdownClient.set_enable_wifi_connections``).
-
-        :param value: True to enable, False to disable.
-        """
-        await self._lockdown.set_enable_wifi_connections(value)
-
-    async def get_enable_wifi_connections(self) -> bool:
-        """Get whether Wi-Fi lockdown connections are enabled, via the remote lockdown service
-        (see ``LockdownClient.get_enable_wifi_connections``)."""
-        return await self._lockdown.get_enable_wifi_connections()
-
-    async def set_timezone(self, timezone: str) -> None:
-        """Set the device's time zone, via the remote lockdown service (see ``LockdownClient.set_timezone``).
-
-        :param timezone: The time zone identifier to set (e.g. ``"America/New_York"``).
-        """
-        await self._lockdown.set_timezone(timezone)
-
-    async def set_uses24h_clock(self, value: bool) -> None:
-        """Set whether the device uses the 24-hour clock format, via the remote lockdown service
-        (see ``LockdownClient.set_uses24h_clock``).
-
-        :param value: True for 24-hour format, False for 12-hour format.
-        """
-        await self._lockdown.set_uses24h_clock(value)
 
     async def connect(self) -> None:
         """
@@ -314,7 +220,13 @@ class RemoteServiceDiscoveryService(LockdownServiceProvider):
         await self.service.connect()
         try:
             await self.service.send_device_handshake(self.handshake_uuid)
-            self.peer_info = await self.service.receive_response()
+            try:
+                self.peer_info = await asyncio.wait_for(self.service.receive_response(), PEER_INFO_TIMEOUT)
+            except asyncio.TimeoutError as e:
+                address = self.service.address
+                raise RemoteXPCHandshakeTimeoutError(
+                    f"The RSD service at {address[0]}:{address[1]} did not send its peer info during the handshake."
+                ) from e
             self.udid = self.peer_info["Properties"]["UniqueDeviceID"]
             self.product_type = self.peer_info["Properties"]["ProductType"]
 
@@ -395,13 +307,19 @@ class RemoteServiceDiscoveryService(LockdownServiceProvider):
         _ = include_escrow_bag
         return {"Port": self.get_service_port(name), "EnableServiceSSL": False}
 
-    async def create_service_connection(self, port: int) -> ServiceConnection:
+    async def create_service_connection(
+        self, port: int, ssl_context: Optional[SSLContext] = None, strip_ssl: bool = False
+    ) -> ServiceConnection:
         """
         Create a TCP service connection to a port on the device through this RSD.
 
         :param port: device-side TCP port to connect to.
+        :param ssl_context: unsupported; RSD services are reached in plaintext over the tunnel.
+        :param strip_ssl: unsupported, as ``ssl_context``.
         :returns: a connection routed through this RSD's dialer.
         """
+        if ssl_context is not None or strip_ssl:
+            raise ValueError("RSD service connections do not negotiate TLS")
         return await ServiceConnection.create_using_tcp(
             self.service.address[0], port, open_connection=self.open_connection
         )
@@ -422,26 +340,25 @@ class RemoteServiceDiscoveryService(LockdownServiceProvider):
         :raises PyMobileDevice3Exception: if the check-in handshake returns an unexpected response.
         """
         service = await self.start_lockdown_service_without_checkin(name)
-        await service.start()
         try:
             checkin: dict[str, Any] = {"Label": "pymobiledevice3", "ProtocolVersion": "2", "Request": "RSDCheckin"}
             if include_escrow_bag:
                 if self.udid is None:
-                    raise NotConnectedError("RSD is not connected; call connect() first")
+                    raise NotConnectedError("The RSD connection is not open; call connect() first.")
                 pairing_record = get_local_pairing_record(
                     get_remote_pairing_record_filename(self.udid), get_home_folder()
                 )
                 if pairing_record is None:
-                    raise NotPairedError(f"no local pairing record found for {self.udid}")
+                    raise NotPairedError(
+                        f"No local remote pairing record found for {self.udid}; pair the device first."
+                    )
                 checkin["EscrowBag"] = base64.b64decode(pairing_record["remote_unlock_host_key"])
             response = await service.send_recv_plist(checkin)
             if response["Request"] != "RSDCheckin":
-                raise PyMobileDevice3Exception(f'Invalid response for RSDCheckIn: {response}. Expected "RSDCheckIn"')
+                raise ProtocolError(f"The device sent an unexpected reply to the {name} check-in: {response}")
             response = await service.recv_plist()
             if response["Request"] != "StartService":
-                raise PyMobileDevice3Exception(
-                    f'Invalid response for RSDCheckIn: {response}. Expected "ServiceService"'
-                )
+                raise ProtocolError(f"The device sent an unexpected reply while starting {name}: {response}")
             error = response.get("Error")
             if error is not None:
                 raise StartServiceError(name, cast(str, error))
@@ -546,7 +463,7 @@ class RemoteServiceDiscoveryService(LockdownServiceProvider):
         """Return a service's ``peer_info`` entry, raising `InvalidServiceError` if absent."""
         service = self._require_peer_info()["Services"].get(name)
         if service is None:
-            raise InvalidServiceError(f"No such service: {name}", self.udid, self.product_version)
+            raise InvalidServiceError(f"The device does not offer the {name} service.", self.udid, self.product_version)
         return service
 
     async def close(self) -> None:

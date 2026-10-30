@@ -1,12 +1,16 @@
 import asyncio
+import contextlib
 import inspect
 import os
+import signal
 import struct
 import sys
+import threading
 import traceback
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Generator
 from functools import wraps
 from pathlib import Path
+from types import FrameType
 from typing import Any, Callable, Optional, TypeVar, Union, cast, overload
 
 import questionary
@@ -177,6 +181,44 @@ def run_in_loop(coro: Coroutine[Any, Any, Any]):
     return get_asyncio_loop().run_until_complete(coro)
 
 
+@contextlib.contextmanager
+def sigint_handler(handler: Callable[[int, Optional[FrameType]], Any]) -> Generator[None, None, None]:
+    """Handle SIGINT with ``handler`` while inside, unless SIGINT is ignored or this is not the main thread."""
+    previous = signal.getsignal(signal.SIGINT)
+    try:
+        if previous is not signal.SIG_IGN:
+            signal.signal(signal.SIGINT, handler)
+    except ValueError:  # not the main thread: signals are only handled there
+        previous = signal.SIG_IGN
+    try:
+        yield
+    finally:
+        if previous is not signal.SIG_IGN:
+            # None: the previous handler was not installed from Python.
+            signal.signal(signal.SIGINT, signal.SIG_DFL if previous is None else previous)
+
+
+@contextlib.contextmanager
+def cancel_on_sigint(task: "asyncio.Future[Any]") -> Generator[Callable[[], bool], None, None]:
+    """Make the first Ctrl-C cancel ``task``, and another raise ``KeyboardInterrupt``, as ``asyncio.run`` does.
+
+    Left to Python, Ctrl-C raises ``KeyboardInterrupt`` wherever the main thread happens to be. Inside a
+    task's step or a transport callback, the task keeps it as its result and whatever awaits that task
+    raises it again, so ``finally`` blocks stop halfway. Yields whether Ctrl-C was pressed.
+    """
+    interrupted = False
+
+    def handler(signum: int, frame: Optional[FrameType]) -> None:
+        nonlocal interrupted
+        if interrupted or task.done():
+            raise KeyboardInterrupt
+        interrupted = True
+        task.get_loop().call_soon_threadsafe(task.cancel)
+
+    with sigint_handler(handler):
+        yield lambda: interrupted
+
+
 def ask_prompt(question: questionary.Question) -> Any:
     """Ask a questionary prompt from either a sync or an async calling context.
 
@@ -211,13 +253,39 @@ def start_ipython_shell(*, user_ns: Optional[dict[str, Any]] = None, header: Opt
     cast(Any, IPython).start_ipython(argv=[], config=config, user_ns=user_ns or {})
 
 
-def file_download(url: str, outfile: Path, chunk_size: int = 1024) -> None:
-    resp = requests.get(url, stream=True, timeout=30)
-    total = int(resp.headers.get("content-length", 0))
+def file_download(
+    url: str,
+    outfile: Path,
+    chunk_size: int = 1024 * 1024,
+    resume: bool = False,
+    stop: Optional[threading.Event] = None,
+) -> bool:
+    """
+    Download ``url`` into ``outfile``.
+
+    :param resume: continue a partial ``outfile`` with a range request (restarting if the server ignores it)
+    :param stop: checked between chunks; once set, the download stops and keeps what it wrote so far
+    :returns: whether the download completed
+    """
+    offset = outfile.stat().st_size if resume and outfile.exists() else 0
+    headers = {"Range": f"bytes={offset}-"} if offset else {}
+    resp = requests.get(url, stream=True, timeout=30, headers=headers)
+    if offset and resp.status_code == 416:
+        # Nothing left to fetch: the partial file is already complete
+        return True
+    # Never save an HTTP error page as the requested file
+    resp.raise_for_status()
+    if resp.status_code != 206:
+        offset = 0
+    total = offset + int(resp.headers.get("content-length", 0))
     with (
-        outfile.open("wb") as file,
+        outfile.open("ab" if offset else "wb") as file,
         ProgressBar(total=total, desc=outfile.name, unit=BYTES_UNIT) as bar,
     ):
+        bar.update(offset)
         for data in resp.iter_content(chunk_size=chunk_size):
+            if stop is not None and stop.is_set():
+                return False
             size = file.write(data)
             bar.update(size)
+    return True

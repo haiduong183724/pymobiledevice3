@@ -1,5 +1,12 @@
 import asyncio
+import hashlib
+import os
 import pathlib
+import posixpath
+import re
+import struct
+import uuid
+from collections.abc import AsyncGenerator
 from datetime import datetime
 from typing import Any, ClassVar, cast
 
@@ -10,7 +17,7 @@ from pymobiledevice3.exceptions import AfcException, AfcFileNotFoundError, Conne
 from pymobiledevice3.lockdown import LockdownClient
 from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
 from pymobiledevice3.service_connection import ServiceConnection
-from pymobiledevice3.services.afc import MAXIMUM_READ_SIZE, AfcError, AfcService
+from pymobiledevice3.services.afc import MAXIMUM_READ_SIZE, AfcError, AfcOpcode, AfcService
 
 TEST_FILENAME = "test"
 TEST_FOLDER_NAME = "test_folder"
@@ -68,6 +75,91 @@ async def test_rm_file_doesnt_exist(afc: AfcService, path: str) -> None:
     with pytest.raises(AfcFileNotFoundError) as e:
         await afc.rm(path)
     assert e.value.status == AfcError.OBJECT_NOT_FOUND
+
+
+async def test_rm_tree_in_one_request(afc: AfcService, monkeypatch: pytest.MonkeyPatch) -> None:
+    await afc.rm(TEST_FOLDER_NAME, force=True)
+    for d in range(3):
+        await afc.makedirs(f"{TEST_FOLDER_NAME}/d{d}/sub")
+        await afc.set_file_contents(f"{TEST_FOLDER_NAME}/d{d}/sub/file", b"data")
+    opcodes = []
+    do_operation = afc._do_operation
+
+    async def recording_do_operation(opcode, *args, **kwargs):
+        opcodes.append(opcode)
+        return await do_operation(opcode, *args, **kwargs)
+
+    monkeypatch.setattr(afc, "_do_operation", recording_do_operation)
+    try:
+        assert await afc.rm(TEST_FOLDER_NAME) == []
+        assert opcodes == [AfcOpcode.REMOVE_PATH_AND_CONTENTS]
+        assert not await afc.exists(TEST_FOLDER_NAME)
+    finally:
+        await afc.rm(TEST_FOLDER_NAME, force=True)
+
+
+_RM_MATCH_LAYOUT = (
+    "drop_top.txt",
+    "keep_top.txt",
+    "drop_dir/drop_nested.txt",
+    "drop_dir/keep_nested.txt",
+    "drop_dir/drop_sub/drop_deep.txt",
+    "drop_dir/keep_sub/drop_skipped.txt",
+    "keep_dir/drop_skipped.txt",
+)
+
+
+@pytest_asyncio.fixture(scope="function")
+async def rm_match_tree(afc: AfcService) -> AsyncGenerator[str, None]:
+    root = f"/pmd3_rm_match_{uuid.uuid4().hex}"
+    for name in _RM_MATCH_LAYOUT:
+        path = posixpath.join(root, name)
+        await afc.makedirs(posixpath.dirname(path))
+        await afc.set_file_contents(path, b"data")
+    try:
+        yield root
+    finally:
+        await afc.rm(root, force=True)
+
+
+async def _files_under(afc: AfcService, root: str) -> set[str]:
+    return {
+        posixpath.relpath(posixpath.join(dirpath, name), root)
+        async for dirpath, _dirs, files in afc.walk(root)
+        for name in files
+    }
+
+
+async def test_rm_match_removes_exactly_what_pull_copies(
+    afc: AfcService, rm_match_tree: str, tmp_path: pathlib.Path
+) -> None:
+    match = re.compile(r"drop_")
+    await afc.pull(rm_match_tree, str(tmp_path), match=match, progress_bar=False)
+    pulled_root = tmp_path / posixpath.basename(rm_match_tree)
+    pulled = {path.relative_to(pulled_root).as_posix() for path in pulled_root.rglob("*") if path.is_file()}
+
+    assert await afc.rm(rm_match_tree, match=match) == []
+
+    remaining = await _files_under(afc, rm_match_tree)
+    assert pulled == {"drop_top.txt", "drop_dir/drop_nested.txt", "drop_dir/drop_sub/drop_deep.txt"}
+    assert remaining == set(_RM_MATCH_LAYOUT) - pulled
+    # directories are never removed when a match is given
+    for directory in ("drop_dir", "drop_dir/drop_sub", "drop_dir/keep_sub", "keep_dir"):
+        assert await afc.isdir(posixpath.join(rm_match_tree, directory))
+
+
+async def test_rm_match_single_file(afc: AfcService, rm_match_tree: str) -> None:
+    keep = posixpath.join(rm_match_tree, "keep_top.txt")
+    drop = posixpath.join(rm_match_tree, "drop_top.txt")
+    assert await afc.rm(keep, match=re.compile(r"drop_")) == []
+    assert await afc.exists(keep)
+    assert await afc.rm(drop, match=re.compile(r"drop_")) == []
+    assert not await afc.exists(drop)
+
+
+async def test_rm_match_missing_path(afc: AfcService) -> None:
+    with pytest.raises(AfcFileNotFoundError):
+        await afc.rm(f"/pmd3_rm_match_missing_{uuid.uuid4().hex}", match=re.compile("x"))
 
 
 async def test_get_device_info(afc: AfcService) -> None:
@@ -516,6 +608,159 @@ async def test_push_pull_bigger_than_max_chunk(afc: AfcService) -> None:
     await afc.set_file_contents("test", contents)
     assert contents == await afc.get_file_contents("test")
     await afc.rm("test")
+
+
+OPS_FOLDER = "__pymobiledevice3_afc_ops_tests"
+OPS_FILE = f"{OPS_FOLDER}/file"
+OPS_DATA = bytes(range(256))[::-1] * 37 + b"tail"
+
+
+@pytest_asyncio.fixture(scope="function")
+async def ops_afc(afc: AfcService):
+    await afc.rm(OPS_FOLDER, force=True)
+    await afc.makedirs(OPS_FOLDER)
+    await afc.set_file_contents(OPS_FILE, OPS_DATA)
+    try:
+        yield afc
+    finally:
+        await afc.rm(OPS_FOLDER, force=True)
+
+
+async def test_get_file_hash(ops_afc: AfcService) -> None:
+    assert await ops_afc.get_file_hash(OPS_FILE) == hashlib.sha1(OPS_DATA).digest()
+
+
+async def test_get_file_hash_empty_file(ops_afc: AfcService) -> None:
+    await ops_afc.set_file_contents(f"{OPS_FOLDER}/empty", b"")
+    assert await ops_afc.get_file_hash(f"{OPS_FOLDER}/empty") == hashlib.sha1(b"").digest()
+
+
+async def test_get_file_hash_errors(ops_afc: AfcService) -> None:
+    with pytest.raises(AfcFileNotFoundError):
+        await ops_afc.get_file_hash(f"{OPS_FOLDER}/missing")
+    with pytest.raises(AfcException) as e:
+        await ops_afc.get_file_hash(OPS_FOLDER)
+    assert e.value.status == AfcError.OBJECT_IS_DIR
+
+
+async def test_get_file_hash_range(ops_afc: AfcService) -> None:
+    assert await ops_afc.get_file_hash_range(OPS_FILE, 100, 300) == hashlib.sha1(OPS_DATA[100:400]).digest()
+    assert await ops_afc.get_file_hash_range(OPS_FILE, len(OPS_DATA) - 1, 1) == hashlib.sha1(OPS_DATA[-1:]).digest()
+    with pytest.raises(AfcException) as e:
+        await ops_afc.get_file_hash_range(OPS_FILE, 1, len(OPS_DATA))
+    assert e.value.status == AfcError.INVALID_ARG
+
+
+async def test_set_file_time(ops_afc: AfcService) -> None:
+    mtime = datetime(2020, 9, 13, 12, 26, 40, 123456)
+    await ops_afc.set_file_time(OPS_FILE, mtime)
+    assert (await ops_afc.stat(OPS_FILE))["st_mtime"] == mtime
+    with pytest.raises(AfcFileNotFoundError):
+        await ops_afc.set_file_time(f"{OPS_FOLDER}/missing", mtime)
+
+
+async def test_truncate(ops_afc: AfcService) -> None:
+    await ops_afc.truncate(OPS_FILE, 100)
+    assert await ops_afc.get_file_contents(OPS_FILE) == OPS_DATA[:100]
+    await ops_afc.truncate(OPS_FILE, 200)
+    assert await ops_afc.get_file_contents(OPS_FILE) == OPS_DATA[:100] + b"\0" * 100
+
+
+async def test_get_size_of_path_contents(ops_afc: AfcService) -> None:
+    await ops_afc.makedirs(f"{OPS_FOLDER}/a/b")
+    await ops_afc.set_file_contents(f"{OPS_FOLDER}/a/b/nested", b"x" * 5000)
+    size = await ops_afc.get_size_of_path_contents(OPS_FOLDER)
+    assert size["st_size"] == len(OPS_DATA) + 5000
+    assert size["st_blocks"] > 0
+    with pytest.raises(AfcFileNotFoundError):
+        await ops_afc.get_size_of_path_contents(f"{OPS_FOLDER}/missing")
+
+
+async def test_get_connection_info(afc: AfcService) -> None:
+    info = await afc.get_connection_info()
+    assert "afc" in info["Version"]
+
+
+async def test_ftell_and_ftruncate(ops_afc: AfcService) -> None:
+    handle = await ops_afc.fopen(OPS_FILE, "r+")
+    try:
+        assert await ops_afc.ftell(handle) == 0
+        await ops_afc.fseek(handle, 300)
+        assert await ops_afc.ftell(handle) == 300
+        await ops_afc.ftruncate(handle, 1000)
+        assert await ops_afc.ftell(handle) == 300
+    finally:
+        await ops_afc.fclose(handle)
+    assert (await ops_afc.stat(OPS_FILE))["st_size"] == 1000
+    assert await ops_afc.get_file_contents(OPS_FILE) == OPS_DATA[:1000]
+
+
+async def test_pread_pwrite(ops_afc: AfcService) -> None:
+    handle = await ops_afc.fopen(OPS_FILE, "r+")
+    try:
+        await ops_afc.fseek(handle, 10)
+        assert await ops_afc.pread(handle, 7, 1234) == OPS_DATA[1234:1241]
+        assert await ops_afc.pread(handle, 100, len(OPS_DATA) - 2) == OPS_DATA[-2:]
+        assert await ops_afc.pread(handle, 100, len(OPS_DATA) + 100) == b""
+        await ops_afc.pwrite(handle, b"ABCDEFG", 3000)
+        await ops_afc.pwrite(handle, b"END", len(OPS_DATA) + 10)
+        # positional I/O leaves the handle's position alone
+        assert await ops_afc.ftell(handle) == 10
+    finally:
+        await ops_afc.fclose(handle)
+    expected = OPS_DATA[:3000] + b"ABCDEFG" + OPS_DATA[3007:] + b"\0" * 10 + b"END"
+    assert await ops_afc.get_file_contents(OPS_FILE) == expected
+
+
+async def test_pread_pwrite_bigger_than_max_chunk(ops_afc: AfcService) -> None:
+    contents = os.urandom(MAXIMUM_READ_SIZE + 1000)
+    handle = await ops_afc.fopen(OPS_FILE, "w+")
+    try:
+        await ops_afc.pwrite(handle, contents, 0, chunk_size=MAXIMUM_READ_SIZE)
+        assert await ops_afc.pread(handle, len(contents) + 10, 0) == contents
+    finally:
+        await ops_afc.fclose(handle)
+
+
+class _RecordingAfc(AfcService):
+    """Records the packets an operation sends and answers each with a canned reply."""
+
+    def __init__(self, reply: bytes = b"") -> None:
+        super().__init__(cast(LockdownServiceProvider, object()), service_name="com.apple.afc")
+        self.sent: list[tuple[AfcOpcode, bytes, int]] = []
+        self.reply = reply
+
+    async def _send_and_wait(self, operation: AfcOpcode, data: bytes, this_length: int = 0):
+        self.sent.append((operation, data, this_length))
+        return AfcError.SUCCESS, self.reply
+
+
+async def test_request_layouts() -> None:
+    afc = _RecordingAfc(reply=struct.pack("<Q", 42))
+    assert await afc.ftell(3) == 42
+    await afc.ftruncate(3, 1000)
+    await afc.pread(3, 8, 100)
+    await afc.truncate("f", 5)
+    await afc.set_file_time("f", datetime.fromtimestamp(1600000000.123456))
+    await afc.get_file_hash_range("f", 1, 2)
+    assert afc.sent == [
+        (AfcOpcode.FILE_TELL, struct.pack("<Q", 3), 0),
+        (AfcOpcode.FILE_SET_SIZE, struct.pack("<QQ", 3, 1000), 0),
+        (AfcOpcode.FILE_READ_OFFSET, struct.pack("<QQQ", 3, 8, 100), 0),
+        (AfcOpcode.TRUNCATE, struct.pack("<Q", 5) + b"f\0", 0),
+        (AfcOpcode.SET_FILE_TIME, struct.pack("<Q", 1600000000123456000) + b"f\0", 0),
+        (AfcOpcode.GET_FILE_HASH_RANGE, struct.pack("<QQ", 1, 2) + b"f\0", 0),
+    ]
+
+
+async def test_pwrite_sends_offset_header_and_chunks() -> None:
+    afc = _RecordingAfc()
+    await afc.pwrite(7, b"abcde", 10, chunk_size=2)
+    assert afc.sent == [
+        (AfcOpcode.FILE_WRITE_OFFSET, struct.pack("<QQ", 7, 10) + b"ab", 56),
+        (AfcOpcode.FILE_WRITE_OFFSET, struct.pack("<QQ", 7, 12) + b"cd", 56),
+        (AfcOpcode.FILE_WRITE_OFFSET, struct.pack("<QQ", 7, 14) + b"e", 56),
+    ]
 
 
 async def test_concurrent_operations(lockdown: LockdownClient) -> None:

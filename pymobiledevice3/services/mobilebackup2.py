@@ -9,7 +9,7 @@ import uuid
 from collections.abc import Callable, Sequence
 from contextlib import asynccontextmanager, closing, suppress
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional, Union, cast
@@ -28,9 +28,9 @@ from pymobiledevice3.exceptions import (
     ConnectionTerminatedError,
     LockdownError,
     NotConnectedError,
+    ProtocolError,
     PyMobileDevice3Exception,
 )
-from pymobiledevice3.lockdown import LockdownClient
 from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
 from pymobiledevice3.safe_paths import validate_device_filename
 from pymobiledevice3.services.afc import AFC_LOCK_EX, AFC_LOCK_UN, AfcError, AfcService
@@ -191,16 +191,13 @@ class Mobilebackup2Service(LockdownService):
     RSD_SERVICE_NAME = "com.apple.mobilebackup2.shim.remote"
 
     def __init__(self, lockdown: LockdownServiceProvider) -> None:
-        if isinstance(lockdown, LockdownClient):
-            super().__init__(lockdown, self.SERVICE_NAME, include_escrow_bag=True)
-        else:
-            super().__init__(lockdown, self.RSD_SERVICE_NAME, include_escrow_bag=True)
+        super().__init__(lockdown, include_escrow_bag=True)
 
     @property
     def _udid(self) -> str:
         udid = self.lockdown.udid
         if udid is None:
-            raise NotConnectedError("lockdown provider has no udid; connect it first")
+            raise NotConnectedError("The device UDID is unknown; connect to the device first.")
         return validate_device_filename(udid)
 
     async def get_will_encrypt(self) -> bool:
@@ -271,8 +268,7 @@ class Mobilebackup2Service(LockdownService):
 
                 # Initialize Status.plist file if doesn't exist.
                 status_path = device_directory / "Status.plist"
-                current_date = datetime.now()
-                current_date = current_date.replace(tzinfo=None)
+                current_date = datetime.now(timezone.utc).replace(tzinfo=None)
                 if full or not status_path.exists():
                     with open(device_directory / "Status.plist", "wb") as fd:
                         plistlib.dump(
@@ -548,6 +544,24 @@ class Mobilebackup2Service(LockdownService):
             await dl.send_process_message(message)
             await dl.dl_loop()
 
+    async def set_cloud_backup(self, enabled: bool) -> None:
+        """
+        Turn iCloud Backup on or off.
+
+        The device refuses with ``MBErrorDomain/1`` when no iCloud account is signed in.
+
+        :param enabled: True to turn iCloud Backup on, False to turn it off.
+        """
+        # no files are exchanged, but the device link needs a root directory
+        with tempfile.TemporaryDirectory() as root:
+            async with self.device_link(Path(root)) as dl:
+                await dl.send_process_message({
+                    "MessageName": "EnableCloudBackup",
+                    "TargetIdentifier": self.lockdown.udid,
+                    "CloudBackupState": enabled,
+                })
+                await dl.dl_loop()
+
     async def erase_device(self, backup_directory: Union[str, Path] = ".") -> None:
         """
         Erase the device, restoring it to factory state.
@@ -681,7 +695,9 @@ class Mobilebackup2Service(LockdownService):
                     break
             else:  # No break, lock failed.
                 await afc.fclose(lockfile)
-                raise PyMobileDevice3Exception("Failed to lock itunes sync file")
+                raise PyMobileDevice3Exception(
+                    "Could not lock the device's sync lock file; another sync or backup may be running."
+                )
         try:
             yield
         finally:
@@ -932,7 +948,7 @@ class Mobilebackup2Service(LockdownService):
 
         manifest_plist_path = Mobilebackup2Service._backup_manifest_plist_path(device_directory)
         if manifest_plist_path is None:
-            raise PyMobileDevice3Exception("Encrypted backup Manifest.plist was not received before Manifest.db")
+            raise ProtocolError("The device sent the encrypted backup's Manifest.db before its Manifest.plist.")
 
         manifest = ManifestPlist.from_path(manifest_plist_path)
         keybag = Keybag.from_manifest(manifest, password)
@@ -949,7 +965,9 @@ class Mobilebackup2Service(LockdownService):
         plaintext = decrypted_manifest_path.read_bytes()
         algorithm = algorithms.AES(manifest_key)
         if len(plaintext) % (algorithm.block_size // 8):
-            raise PyMobileDevice3Exception("Decrypted backup Manifest.db is not AES block aligned")
+            raise PyMobileDevice3Exception(
+                "The decrypted backup Manifest.db has an invalid size: it is not a whole number of AES blocks."
+            )
 
         cipher = Cipher(algorithm, modes.CBC(b"\x00" * 16))
         encryptor = cipher.encryptor()

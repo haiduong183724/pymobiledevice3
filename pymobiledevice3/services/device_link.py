@@ -1,6 +1,7 @@
 import ctypes
 import ctypes.util
 import datetime
+import errno
 import logging
 import shutil
 import struct
@@ -11,7 +12,7 @@ from io import BufferedWriter
 from pathlib import Path
 from typing import Any, Callable, Optional, cast
 
-from pymobiledevice3.exceptions import NotEnoughDiskSpaceError, PyMobileDevice3Exception
+from pymobiledevice3.exceptions import NotEnoughDiskSpaceError, ProtocolError, PyMobileDevice3Exception
 from pymobiledevice3.safe_paths import resolve_device_path
 from pymobiledevice3.service_connection import ServiceConnection
 
@@ -31,15 +32,14 @@ PURGE_DISK_SPACE_ERROR_STRING = "DLPurgeDiskSpace failed to purge"
 PURGE_REQUEST_OVERSHOOT = 0x80000000
 # MBErrorDomain/105, the device's own verdict once the host answers the purge request.
 MB_ERROR_INSUFFICIENT_DISK_SPACE = 105
-APPLE_EPOCH = 978307200
 ERRNO_TO_DEVICE_ERROR = {
-    2: -6,
-    17: -7,
-    20: -8,
-    21: -9,
-    62: -10,
-    5: -11,
-    28: -15,
+    errno.ENOENT: -6,
+    errno.EEXIST: -7,
+    errno.ENOTDIR: -8,
+    errno.EISDIR: -9,
+    errno.ELOOP: -10,
+    errno.EIO: -11,
+    errno.ENOSPC: -15,
 }
 
 DLMessage = Sequence[Any]
@@ -166,7 +166,7 @@ class DeviceLink:
                 elif message[1]["ErrorCode"] == MB_ERROR_INSUFFICIENT_DISK_SPACE:
                     raise NotEnoughDiskSpaceError(self._insufficient_disk_space_error(message[1]))
                 else:
-                    raise PyMobileDevice3Exception(f"Device link error: {message[1]}")
+                    raise PyMobileDevice3Exception(f"The device reported an error: {message[1]}")
             await self._dl_handlers[command](message)
 
     def _insufficient_disk_space_error(self, response: Mapping[str, Any]) -> str:
@@ -219,7 +219,7 @@ class DeviceLink:
         await self.service.send_plist(["DLMessageVersionExchange", "DLVersionsOk", version_major])
         dl_message_device_ready = await self.receive_message()
         if dl_message_device_ready[0] != "DLMessageDeviceReady":
-            raise PyMobileDevice3Exception("Device link didn't return ready state")
+            raise ProtocolError("The device did not report it was ready to start the session.")
 
     async def send_process_message(self, message: Mapping[str, Any]) -> None:
         await self.service.send_plist(["DLMessageProcessMessage", message])
@@ -267,7 +267,7 @@ class DeviceLink:
                 assert e.errno is not None and e.strerror is not None
                 status[file] = {
                     "DLFileErrorString": e.strerror,
-                    "DLFileErrorCode": ctypes.c_uint64(ERRNO_TO_DEVICE_ERROR[e.errno]).value,
+                    "DLFileErrorCode": ctypes.c_uint64(ERRNO_TO_DEVICE_ERROR.get(e.errno, -1)).value,
                 }
                 error_bytes = e.strerror.encode()
                 await self._sendall(
@@ -291,7 +291,8 @@ class DeviceLink:
                 ftype = "DLFileTypeDirectory"
             if file.is_file():
                 ftype = "DLFileTypeRegular"
-            modifications_data = datetime.datetime.fromtimestamp(file.stat().st_mtime - APPLE_EPOCH)
+            # plistlib expects naive UTC datetimes and handles the Apple epoch.
+            modifications_data = datetime.datetime.fromtimestamp(file.stat().st_mtime, datetime.timezone.utc)
             modifications_data = modifications_data.replace(tzinfo=None)
             data[file.name] = {
                 "DLFileType": ftype,

@@ -22,6 +22,7 @@ Explicit tunnel setup is rarely needed: on iOS 17.4+, commands that require an R
 - `afc`: media-domain shell, pull, push, ls, rm.
 - `apps`: list/query/install/uninstall apps and work with app AFC/container helpers.
 - `crash`: browse, pull, clear, watch crash reports and sysdiagnose artifacts.
+- `mobilesync`: dump, add, modify or delete contacts, calendars, Safari bookmarks and mail accounts without a backup.
 - Services to inspect when extending: `services/afc.py`, `services/house_arrest.py`, `services/installation_proxy.py`, `services/crash_reports.py`.
 
 Use these for browsing files, copying artifacts, or handling app containers.
@@ -76,7 +77,7 @@ Use WebInspector for Safari/WebView automation and WDA for device UI automation.
 - `developer core-device`: file/process/app/device-info operations through CoreDevice flows; `launch-application --console` prints the app's stdout/stderr; `write-file` / `stat` / `rename` / `remove-file` / `create-directory` / `create-symlink` edit a file-service domain and `watch` streams its file changes (iOS 27+).
 - `developer debugserver`: debugserver launch and LLDB bridging.
 - `developer fetch-symbols`: symbol acquisition; `download` keeps symbols it already downloaded unless given `--force`.
-- `developer accessibility`: audits, settings, notifications, item listing.
+- `developer accessibility`: audits, settings, notifications, item listing, element attributes.
 - `developer simulate-location`: DVT-based location simulation.
 - `developer arbitration`: device arbitration (check-in/check-out for exclusive use).
 - `developer shell`: IPython shell connected to a named developer service (exploration/R&D).

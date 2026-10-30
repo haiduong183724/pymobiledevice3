@@ -131,25 +131,21 @@ Key properties that fall out of this shape:
 
 ### Dialing a service connection
 
-Services call the RSD's injected `open_connection`, which relays through a single
-pre-bound listener; the target port travels in-band as a 2-byte header, so nothing ever
-binds on the dial path:
+Services call the RSD's injected `open_connection`, which creates a `socketpair()`, hands
+one end to the caller and starts a relay task on the other:
 
 ```mermaid
 sequenceDiagram
     participant S as ServiceConnection
     participant D as dial()
-    participant L as relay listener
-    participant H as handler
+    participant H as relay task
     participant P as pytcp socket
     participant Dev as device service
 
     S->>D: open_connection(fdxx::1, port)
-    D->>L: connect (unix socket)
-    D->>L: 2-byte port header
+    D->>D: socketpair()
+    D->>H: spawn relay task (port, other end)
     D-->>S: (reader, writer)
-    L->>H: spawn per-connection handler
-    H->>H: read port header
     H->>P: connect_tcp(fdxx::1, port)
     P->>Dev: SYN ... over the tunnel
     loop two pump tasks
@@ -159,12 +155,12 @@ sequenceDiagram
     Note over H,P: client EOF fully closes the pytcp socket<br/>(FIN reaches the device — orphan reaper owns the tail)<br/>device EOF reaches the client as write_eof
 ```
 
-Why a unix socket for the hand-off: it lives in a `0700` temp directory, so filesystem
-permissions decide who may connect — a loopback TCP port would be connectable by any local
-process for the tunnel's whole lifetime. Loopback TCP remains the fallback where `AF_UNIX`
-does not exist (Windows), and `PYMOBILEDEVICE3_USERSPACE_TCP_RELAY` forces it anywhere for
-debugging. A connection that never sends its port header is shed after a timeout instead
-of pinning a handler.
+Why a socketpair for the hand-off: nothing listens, so no other process can reach the
+device's services through the relay (a loopback TCP listener was connectable by any local
+process for the tunnel's whole lifetime). It also never depends on how the platform
+completes a connect: iSH's `AF_UNIX` connect blocks until the peer accepts, which deadlocked
+the event loop when the dial plane accepted its own connections (#2068). On Windows CPython
+emulates `socketpair()` over loopback TCP and verifies the peer before returning it.
 
 ### Device disconnect and teardown
 
@@ -240,7 +236,7 @@ flowchart LR
     dev["iOS device<br/>RSD + services at fdxx::1"]
 
     cli -->|"XPC: browse / CreateAssertion"| rp
-    cli -->|"nettop sample<br/>(find remoted's RSD port)"| rd
+    cli -->|"socket table<br/>(find remoted's RSD port)"| rd
     rp -.->|"keeps the tunnel alive"| rd
     rd -->|"encrypted CoreDevice tunnel"| dev
     cli -->|"TCP6 to [fdxx::1]:rsd_port<br/>(kernel-routable)"| dev
@@ -254,12 +250,13 @@ How it works (all via `ctypes` + libxpc, no pyobjc):
 2. `RemotePairing.CreateAssertionCommand` returns the device's in-tunnel `tunnelIPAddress` and an
    assertion identifier that keeps Apple's tunnel up for as long as the handle is held.
 3. Find the in-tunnel RSD port by matching `remoted`'s own TCP connection to that tunnel address
-   in one `nettop -L 1 -m tcp` sample (no root). nettop rather than the `net.inet.tcp.pcblist*`
-   sysctls because, starting with macOS 27, the kernel returns only the caller's own sockets from
-   those to non-root processes, which hides root-owned `remoted`. nettop still sees every
-   process's sockets only because it is Apple-signed with `com.apple.private.network.statistics`;
-   the NetworkStatistics feed behind it gives an unentitled process the same own-uid view, so it
-   has to be the entitled binary, not a direct framework call.
+   in the `net.inet.tcp.pcblist_n` socket table (no root). Starting with macOS 27, the kernel shows
+   other processes' sockets only to a platform binary whose non-platform ancestors are all Apple or
+   Developer ID signed, which hides root-owned `remoted` from us and from any `sysctl` we spawn
+   directly. So `/usr/sbin/sysctl` is run double-forked: once launchd adopts it, it has no other
+   ancestors and sees the whole table. If the table still comes back without a single connection,
+   the scan falls back to one `nettop -L 1 -m tcp` sample, which sees every socket only because
+   nettop is Apple-signed with `com.apple.private.network.statistics` (about 4x slower).
 4. Connect a normal TCP socket to `[tunnelIPAddress]:rsd_port` — the tunnel address is
    kernel-routable — and run the standard RSD handshake.
 

@@ -1,8 +1,6 @@
 from typing import Any, Optional
 
 from pymobiledevice3.exceptions import DeprecationError, PyMobileDevice3Exception
-from pymobiledevice3.lockdown import LockdownClient
-from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
 from pymobiledevice3.services.lockdown_service import LockdownService
 
 MobileGestaltKeys = [
@@ -961,15 +959,6 @@ class DiagnosticsService(LockdownService):
     SERVICE_NAME = "com.apple.mobile.diagnostics_relay"
     OLD_SERVICE_NAME = "com.apple.iosdiagnostics.relay"
 
-    def __init__(self, lockdown: LockdownServiceProvider):
-        """
-        :param lockdown: Lockdown service provider used to establish the diagnostics relay connection. When it is a
-            `LockdownClient`, the classic lockdown service name is used; otherwise the
-            RemoteXPC (RSD) service name is used.
-        """
-        service_name = self.SERVICE_NAME if isinstance(lockdown, LockdownClient) else self.RSD_SERVICE_NAME
-        super().__init__(lockdown, service_name, service=None)
-
     async def _send_recv(self, request: dict[str, Any]) -> dict[str, Any]:
         return await self.service.send_recv_plist(request)
 
@@ -991,11 +980,13 @@ class DiagnosticsService(LockdownService):
         response = await self._send_recv({"Request": "MobileGestalt", "MobileGestaltKeys": keys})
 
         if response["Diagnostics"]["MobileGestalt"]["Status"] == "MobileGestaltDeprecated":
-            err_msg = f"failed to query MobileGestalt, MobileGestalt deprecated (iOS >= 17.4). Got response {response}"
+            err_msg = (
+                f"Failed to query MobileGestalt: it is deprecated on iOS 17.4 and later. The device replied: {response}"
+            )
             raise DeprecationError(err_msg)
 
         if (response["Status"] != "Success") or (response["Diagnostics"]["MobileGestalt"]["Status"] != "Success"):
-            raise PyMobileDevice3Exception("failed to query MobileGestalt")
+            raise PyMobileDevice3Exception(f"The device failed to query MobileGestalt: {response}")
 
         response["Diagnostics"]["MobileGestalt"].pop("Status")
 
@@ -1014,7 +1005,7 @@ class DiagnosticsService(LockdownService):
         """
         response = await self._send_recv({"Request": action})
         if response["Status"] != "Success":
-            raise PyMobileDevice3Exception(f"failed to perform action: {action}")
+            raise PyMobileDevice3Exception(f"The device failed the {action} diagnostics request: {response}")
         return response.get("Diagnostics")
 
     async def restart(self):
@@ -1084,7 +1075,7 @@ class DiagnosticsService(LockdownService):
 
         response = await self._send_recv(d)
         if response.get("Status") != "Success":
-            raise PyMobileDevice3Exception(f"got invalid response: {response}")
+            raise PyMobileDevice3Exception(f"The device failed the IORegistry query: {response}")
 
         dd = response.get("Diagnostics")
         if dd:

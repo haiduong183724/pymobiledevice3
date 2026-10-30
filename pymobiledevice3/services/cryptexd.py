@@ -1,3 +1,4 @@
+import asyncio
 import dataclasses
 import enum
 import logging
@@ -164,6 +165,13 @@ CLIENT_VERSION = 3
 #: difference to that. Nothing here shows what ends a ``persistence`` of 2, or how 1 differs.
 DDI_PERSISTENCE = 2
 DDI_NONCE_PERSISTENCE = 1
+
+#: Seconds `CryptexdService.install` waits for cryptexd's reply once every payload is pushed.
+#:
+#: cryptexd can fail an install without ever replying: on a virtual iPhone 27.0 (24A435) whose
+#: kernel sandbox denies it ``F_SETPROTECTIONCLASS``, it logs "staging failed [1: Operation not
+#: permitted]" and leaves the connection open and silent, so an unbounded wait hangs forever.
+INSTALL_REPLY_TIMEOUT = 60
 
 #: Earliest iOS that installs the DeveloperDiskImage as a cryptex; below it the DDI goes through the
 #: image mounter's PersonalizedDMG, as `auto_mount` does there. Read from the firmware, two things
@@ -475,7 +483,7 @@ class CryptexdService(RemoteService):
         :param nonce_persistence: nonce persistence mode.
         :param auth: authentication mode.
         :raises CryptexdError: if the daemon rejected the request, the install failed, or the daemon
-            closed the connection without replying.
+            closed the connection or sent no reply within `INSTALL_REPLY_TIMEOUT` seconds.
         :raises DeviceFeatureNotSupportedError: if the device does not advertise the
             ``CryptexInstall`` capability.
         """
@@ -504,7 +512,13 @@ class CryptexdService(RemoteService):
             await connection.send_request({"routine": "install", "argv": argv}, wanting_reply=True)
             for transfer_id, (_, payload) in enumerate(transfers, start=1):
                 await connection.send_file_transfer(transfer_id, payload)
-            response = await connection.receive_response()
+            response = await asyncio.wait_for(connection.receive_response(), INSTALL_REPLY_TIMEOUT)
+        except asyncio.TimeoutError as e:
+            raise CryptexdError(
+                f"install failed: cryptexd did not reply within {INSTALL_REPLY_TIMEOUT} seconds of receiving "
+                "the payloads, so it most likely failed without replying; "
+                "`pymobiledevice3 syslog live -m cryptexd` shows why"
+            ) from e
         except ConnectionTerminatedError as e:
             raise CryptexdError(
                 "install failed: cryptexd closed the connection without replying, so it most likely "
@@ -565,10 +579,10 @@ class CryptexdService(RemoteService):
         already_installed = await self._installed_ddi()
         if already_installed is not None:
             raise AlreadyMountedError(
-                f"{already_installed.identifier} {already_installed.version} is already installed"
+                f"The {already_installed.identifier} {already_installed.version} cryptex is already installed."
             )
         if await self._ddi_mounted_by_image_mounter():
-            raise AlreadyMountedError("a Personalized image is already mounted by the image mounter")
+            raise AlreadyMountedError("A Personalized developer disk image is already mounted by the image mounter.")
 
         assets = load_cryptex1_assets(restore_dir)
         request = TSSRequest()

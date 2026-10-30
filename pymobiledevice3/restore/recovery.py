@@ -2,11 +2,10 @@ import asyncio
 import contextlib
 import hashlib
 import logging
-from typing import Any, Optional, cast
+from typing import Any, Optional
 
-from ipsw_parser.build_manifest import BuildManifest
+from ipsw_parser.build_identity import BuildIdentity
 from ipsw_parser.ipsw import IPSW
-from usb import USBError
 
 from pymobiledevice3.exceptions import PyMobileDevice3Exception, TSSError
 from pymobiledevice3.irecv import IRecv, Mode
@@ -15,6 +14,7 @@ from pymobiledevice3.restore.base_restore import BaseRestore, Behavior
 from pymobiledevice3.restore.consts import lpol_file
 from pymobiledevice3.restore.device import Device
 from pymobiledevice3.restore.tss import TSSRequest, TSSResponse
+from pymobiledevice3.usb import UsbError
 
 RESTORE_VARIANT_ERASE_INSTALL = "Erase Install (IPSW)"
 RESTORE_VARIANT_UPGRADE_INSTALL = "Upgrade Install (IPSW)"
@@ -66,7 +66,7 @@ class Recovery(BaseRestore):
 
         return tss.img4_create_local_manifest(build_identity=self.build_identity)
 
-    async def get_tss_response(self) -> TSSResponse:
+    async def get_tss_response(self, build_identity: Optional[BuildIdentity] = None) -> TSSResponse:
         # populate parameters
         parameters: dict[str, Any] = {}
 
@@ -87,7 +87,7 @@ class Recovery(BaseRestore):
         else:
             parameters["ApSupportsImg4"] = False
 
-        self.populate_tss_request_from_manifest(parameters)
+        self.populate_tss_request_from_manifest(parameters, build_identity=build_identity)
 
         tss = TSSRequest()
         tss.add_common_tags(parameters)
@@ -286,10 +286,12 @@ class Recovery(BaseRestore):
             self.tss_localpolicy = await self.get_local_policy_tss_response()
             self.tss_recoveryos_root_ticket = await self.get_recoveryos_root_ticket_tss_response()
         else:
-            info = cast(dict[str, Any], self.build_identity["Info"])
+            info = self.build_identity["Info"]
             recovery_variant = info.get("RecoveryVariant")
             if recovery_variant is not None:
-                self.tss_recoveryos_root_ticket = await self.get_tss_response()
+                if self.recovery_variant is None:
+                    raise PyMobileDevice3Exception(f"Variant {recovery_variant!r} not found in the BuildManifest.")
+                self.tss_recoveryos_root_ticket = await self.get_tss_response(self.recovery_variant)
 
         return self.tss
 
@@ -318,7 +320,7 @@ class Recovery(BaseRestore):
         await self.send_component(component)
         assert self.device.irecv is not None
         self.device.irecv.send_command("go", b_request=1)
-        self.device.irecv.ctrl_transfer(0x21, 1)
+        self.device.irecv.send_zero_length_download()
 
     async def send_applelogo(self, allow_missing: bool = True):
         component = "RestoreLogo"
@@ -328,7 +330,7 @@ class Recovery(BaseRestore):
                 logging.warning(f"build_identity has no {component}")
                 return
             else:
-                raise PyMobileDevice3Exception(f"missing component: {component}")
+                raise PyMobileDevice3Exception(f"The build identity has no {component} component.")
 
         await self.send_component(component)
         assert self.device.irecv is not None
@@ -336,7 +338,7 @@ class Recovery(BaseRestore):
         self.device.irecv.send_command("bgcolor 0 0 0")
 
     async def send_loaded_by_iboot(self):
-        manifest = cast(dict[str, Any], self.build_identity["Manifest"])
+        manifest = self.build_identity["Manifest"]
         for key, node in manifest.items():
             iboot = node["Info"].get("IsLoadedByiBoot", False)
             iboot_stg1 = node["Info"].get("IsLoadedByiBootStage1", False)
@@ -349,7 +351,7 @@ class Recovery(BaseRestore):
                 await self.send_component_and_command(key, "firmware")
 
     async def send_iboot_stage1_components(self):
-        manifest = cast(dict[str, Any], self.build_identity["Manifest"])
+        manifest = self.build_identity["Manifest"]
         for key, node in manifest.items():
             iboot = node["Info"].get("IsLoadedByiBoot", False)
             iboot_stg1 = node["Info"].get("IsLoadedByiBootStage1", False)
@@ -380,13 +382,13 @@ class Recovery(BaseRestore):
 
         await self.send_component(component)
         assert self.device.irecv is not None
-        with contextlib.suppress(USBError):
-            self.device.irecv.ctrl_transfer(0x21, 1)
+        with contextlib.suppress(UsbError):
+            self.device.irecv.send_zero_length_download()
 
         if self.restore_boot_args:
             self.device.irecv.send_command(f"setenv boot-args {self.restore_boot_args}")
 
-        with contextlib.suppress(USBError):
+        with contextlib.suppress(UsbError):
             self.device.irecv.send_command("bootx", b_request=1)
 
     def set_autoboot(self, enable: bool):
@@ -441,7 +443,7 @@ class Recovery(BaseRestore):
 
         if self.build_identity.has_component("RestoreSEP"):
             # attempt to send rsepfirmware and load it, otherwise continue
-            with contextlib.suppress(USBError):
+            with contextlib.suppress(UsbError):
                 await self.send_component_and_command("RestoreSEP", "rsepfirmware")
 
         await self.send_kernelcache()
@@ -451,10 +453,12 @@ class Recovery(BaseRestore):
         await self.reconnect_irecv()
 
         assert self.device.irecv is not None
-        if "SRTG" in self.device.irecv._device_info:
-            raise PyMobileDevice3Exception("Device failed to enter recovery")
+        if self.device.irecv.secure_rom_tag is not None:
+            raise PyMobileDevice3Exception(
+                "The device failed to enter recovery mode: it is still in DFU mode after receiving iBSS."
+            )
 
-        if cast(BuildManifest, self.build_identity.build_manifest).build_major > 8:
+        if self.build_identity.build_manifest.build_major > 8:
             old_nonce = self.device.irecv.ap_nonce
 
             # reconnect
@@ -485,9 +489,9 @@ class Recovery(BaseRestore):
                 await asyncio.sleep(1)
                 self.device.irecv.send_command("go", b_request=1)
 
-                if cast(BuildManifest, self.build_identity.build_manifest).build_major < 20:
-                    with contextlib.suppress(USBError):
-                        self.device.irecv.ctrl_transfer(0x21, 1, timeout=5000)
+                if self.build_identity.build_manifest.build_major < 20:
+                    with contextlib.suppress(UsbError):
+                        self.device.irecv.send_zero_length_download(timeout=5000)
 
                 self.logger.debug("Waiting for device to disconnect...")
                 await asyncio.sleep(10)
@@ -519,7 +523,7 @@ class Recovery(BaseRestore):
 
         elif self.device.irecv.mode.is_recovery:
             # now we load the iBEC
-            with contextlib.suppress(USBError):
+            with contextlib.suppress(UsbError):
                 await self.send_ibec()
 
             await self.reconnect_irecv(is_recovery=True)

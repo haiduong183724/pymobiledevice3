@@ -126,11 +126,6 @@ class OsUtils:
         raise FeatureNotSupportedError(self._os_name, _calling_function_name())
 
     @property
-    def supports_unix_sockets(self) -> bool:
-        """Whether AF_UNIX stream sockets (and asyncio's unix stream APIs) exist on this platform."""
-        raise FeatureNotSupportedError(self._os_name, _calling_function_name())
-
-    @property
     def access_denied_error(self) -> str:
         raise FeatureNotSupportedError(self._os_name, _calling_function_name())
 
@@ -178,6 +173,14 @@ class OsUtils:
 
         Lets "nothing is plugged in" be told apart from "usbmuxd is not listing what is plugged
         in". ``None`` means the platform offers no way to ask.
+        """
+        return None
+
+    def usb_rsd_addresses(self) -> Optional[dict[str, str]]:
+        """The RSD address (``fe80::…%iface``) of each Apple device on USB whose link is up, by UDID.
+
+        Lets RSD discovery go straight to a device's own link instead of browsing bonjour on every
+        interface. ``None`` means the platform offers no way to ask.
         """
         return None
 

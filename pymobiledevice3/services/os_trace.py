@@ -13,8 +13,6 @@ from tarfile import TarFile
 from bytestruct import BinaryStruct, Bytes, OpenIntEnum, u8, u16, u32, u64, uuid_t
 
 from pymobiledevice3.exceptions import ConnectionTerminatedError, DevicePathError, ProtocolError
-from pymobiledevice3.lockdown import LockdownClient
-from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
 from pymobiledevice3.safe_paths import resolve_device_path
 from pymobiledevice3.services.lockdown_service import LockdownService
 from pymobiledevice3.utils import try_decode
@@ -225,12 +223,6 @@ class OsTraceService(LockdownService):
     SERVICE_NAME = "com.apple.os_trace_relay"
     RSD_SERVICE_NAME = "com.apple.os_trace_relay.shim.remote"
 
-    def __init__(self, lockdown: LockdownServiceProvider):
-        if isinstance(lockdown, LockdownClient):
-            super().__init__(lockdown, self.SERVICE_NAME)
-        else:
-            super().__init__(lockdown, self.RSD_SERVICE_NAME)
-
     async def get_pid_list(self):
         """
         Request the device's process list.
@@ -283,11 +275,11 @@ class OsTraceService(LockdownService):
 
         response = await self.service.recvall(1)
         if response[0] != 1:
-            raise ProtocolError(f"got invalid response: {response.hex()}")
+            raise ProtocolError(f"The device sent an unexpected reply to the log archive request: {response.hex()}")
 
         status = plistlib.loads(await self.service.recv_prefixed()).get("Status")
         if status != "RequestSuccessful":
-            raise ProtocolError(f"got invalid status: {status}")
+            raise ProtocolError(f"The device refused to create the log archive: {status}")
 
         while True:
             try:
@@ -295,7 +287,7 @@ class OsTraceService(LockdownService):
             except ConnectionTerminatedError:
                 break
             if magic[0] != 3:
-                raise ProtocolError(f"got invalid magic: {magic.hex()}")
+                raise ProtocolError(f"The device sent a malformed log stream (unexpected chunk marker): {magic.hex()}")
             out.write(await self.service.recv_prefixed(endianity="<"))
 
     async def collect(
@@ -334,11 +326,13 @@ class OsTraceService(LockdownService):
                         destination.parent.mkdir(parents=True, exist_ok=True)
                         source = archive.extractfile(member)
                         if source is None:
-                            raise DevicePathError(f"Missing archive data: {member.name!r}")
+                            raise DevicePathError(f"the log archive entry has no data: {member.name!r}")
                         with source, destination.open("wb") as target:
                             shutil.copyfileobj(source, target)
                     else:
-                        raise DevicePathError(f"Unsupported archive entry: {member.name!r}")
+                        raise DevicePathError(
+                            f"the log archive holds an entry that is neither a file nor a directory: {member.name!r}"
+                        )
 
     async def syslog(
         self,
@@ -375,12 +369,12 @@ class OsTraceService(LockdownService):
         response = plistlib.loads(await self.service.recvall(length))
 
         if response.get("Status") != "RequestSuccessful":
-            raise ProtocolError(f"got invalid response: {response}")
+            raise ProtocolError(f"The device refused to start the log stream: {response}")
 
         while True:
             magic = await self.service.recvall(1)
             if magic != b"\x02":
-                raise ProtocolError(f"got invalid magic: {magic.hex()}")
+                raise ProtocolError(f"The device sent a malformed log stream (unexpected chunk marker): {magic.hex()}")
             (length,) = struct.unpack("<I", await self.service.recvall(4))
             line = await self.service.recvall(length)
             yield parse_syslog_entry(line)

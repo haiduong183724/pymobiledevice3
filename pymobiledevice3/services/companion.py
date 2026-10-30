@@ -2,8 +2,6 @@
 from typing import Any, Optional
 
 from pymobiledevice3.exceptions import PyMobileDevice3Exception
-from pymobiledevice3.lockdown import LockdownClient
-from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
 from pymobiledevice3.services.lockdown_service import LockdownService
 
 
@@ -21,12 +19,6 @@ class CompanionProxyService(LockdownService):
     SERVICE_NAME = "com.apple.companion_proxy"
     RSD_SERVICE_NAME = "com.apple.companion_proxy.shim.remote"
 
-    def __init__(self, lockdown: LockdownServiceProvider):
-        if isinstance(lockdown, LockdownClient):
-            super().__init__(lockdown, self.SERVICE_NAME)
-        else:
-            super().__init__(lockdown, self.RSD_SERVICE_NAME)
-
     async def list(self):
         """
         List the companion devices currently paired with the device.
@@ -36,8 +28,8 @@ class CompanionProxyService(LockdownService):
         :returns: the list of paired devices (the ``PairedDevicesArray`` entry), or an empty list
             if none are present.
         """
-        service = await self.lockdown.start_lockdown_service(self.service_name)
-        return (await service.send_recv_plist({"Command": "GetDeviceRegistry"})).get("PairedDevicesArray", [])
+        async with await self.lockdown.start_lockdown_service(self.service_name) as service:
+            return (await service.send_recv_plist({"Command": "GetDeviceRegistry"})).get("PairedDevicesArray", [])
 
     async def listen_for_devices(self):
         """
@@ -48,10 +40,10 @@ class CompanionProxyService(LockdownService):
 
         :returns: an async generator of device registry change events.
         """
-        service = await self.lockdown.start_lockdown_service(self.service_name)
-        await service.send_plist({"Command": "StartListeningForDevices"})
-        while True:
-            yield await service.recv_plist()
+        async with await self.lockdown.start_lockdown_service(self.service_name) as service:
+            await service.send_plist({"Command": "StartListeningForDevices"})
+            while True:
+                yield await service.recv_plist()
 
     async def get_value(self, udid: str, key: str):
         """
@@ -64,19 +56,19 @@ class CompanionProxyService(LockdownService):
         :returns: the retrieved value dictionary.
         :raises PyMobileDevice3Exception: if the device returns an error instead of a value.
         """
-        service = await self.lockdown.start_lockdown_service(self.service_name)
-        response = await service.send_recv_plist({
-            "Command": "GetValueFromRegistry",
-            "GetValueGizmoUDIDKey": udid,
-            "GetValueKeyKey": key,
-        })
+        async with await self.lockdown.start_lockdown_service(self.service_name) as service:
+            response = await service.send_recv_plist({
+                "Command": "GetValueFromRegistry",
+                "GetValueGizmoUDIDKey": udid,
+                "GetValueKeyKey": key,
+            })
 
         value = response.get("RetrievedValueDictionary")
         if value is not None:
             return value
 
         error = response.get("Error")
-        raise PyMobileDevice3Exception(error)
+        raise PyMobileDevice3Exception(f"The device could not read {key!r} from the paired watch {udid}: {error}")
 
     async def start_forwarding_service_port(
         self, remote_port: int, service_name: Optional[str] = None, options: Optional[dict[str, Any]] = None

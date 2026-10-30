@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import logging
 from asyncio import IncompleteReadError
+from typing import Optional
 
 from pymobiledevice3.exceptions import (
     AmfiError,
@@ -20,12 +21,14 @@ class AmfiService:
 
     Each method opens its own connection to the ``com.apple.amfi.lockdown`` service and sends a single
     ``action`` request. The actions correspond to revealing the Developer Mode toggle in Settings,
-    requesting that it be enabled, and confirming the post-restart prompt.
+    requesting that it be enabled, confirming the post-restart prompt, and trusting the developer
+    app signer of an installed provisioning profile.
     """
 
     DEVELOPER_MODE_REVEAL = 0
     DEVELOPER_MODE_ENABLE = 1
     DEVELOPER_MODE_ACCEPT = 2
+    TRUST_APP_SIGNER = 4
 
     SERVICE_NAME = "com.apple.amfi.lockdown"
 
@@ -42,10 +45,10 @@ class AmfiService:
 
         :raises PyMobileDevice3Exception: if the device does not report success.
         """
-        service = await self._lockdown.start_lockdown_service(self.SERVICE_NAME)
-        resp = await service.send_recv_plist({"action": self.DEVELOPER_MODE_REVEAL})
+        async with await self._lockdown.start_lockdown_service(self.SERVICE_NAME) as service:
+            resp = await service.send_recv_plist({"action": self.DEVELOPER_MODE_REVEAL})
         if not resp.get("success"):
-            raise PyMobileDevice3Exception(f"create_AMFIShowOverridePath() failed with: {resp}")
+            raise PyMobileDevice3Exception(f"The device did not reveal the Developer Mode setting: {resp}")
 
     async def enable_developer_mode(self, enable_post_restart: bool = True):
         """
@@ -62,17 +65,17 @@ class AmfiService:
         :raises AmfiError: if AMFI returns any other error.
         :raises DeveloperModeError: if the enable or post-restart confirmation request does not succeed.
         """
-        service = await self._lockdown.start_lockdown_service(self.SERVICE_NAME)
-        resp = await service.send_recv_plist({"action": self.DEVELOPER_MODE_ENABLE})
+        async with await self._lockdown.start_lockdown_service(self.SERVICE_NAME) as service:
+            resp = await service.send_recv_plist({"action": self.DEVELOPER_MODE_ENABLE})
         error = resp.get("Error")
 
         if error is not None:
             if error == "Device has a passcode set":
                 raise DeviceHasPasscodeSetError()
-            raise AmfiError(error)
+            raise AmfiError(f"AMFI refused to enable Developer Mode: {error}")
 
         if not resp.get("success"):
-            raise DeveloperModeError(f"enable_developer_mode(): {resp}")
+            raise DeveloperModeError(f"The device did not enable Developer Mode: {resp}")
 
         if not enable_post_restart:
             return
@@ -94,7 +97,27 @@ class AmfiService:
 
         :raises DeveloperModeError: if the device does not report success.
         """
-        service = await self._lockdown.start_lockdown_service(self.SERVICE_NAME)
-        resp = await service.send_recv_plist({"action": self.DEVELOPER_MODE_ACCEPT})
+        async with await self._lockdown.start_lockdown_service(self.SERVICE_NAME) as service:
+            resp = await service.send_recv_plist({"action": self.DEVELOPER_MODE_ACCEPT})
         if not resp.get("success"):
-            raise DeveloperModeError(f"enable_developer_mode_post_restart() failed: {resp}")
+            raise DeveloperModeError(f"The device did not confirm Developer Mode after restarting: {resp}")
+
+    async def trust_app_signer(self, profile_uuid: str) -> Optional[bool]:
+        """
+        Trust the developer app signer of an installed provisioning profile.
+
+        Equivalent to tapping "Trust" under Settings > General > VPN & Device Management.
+
+        :param profile_uuid: UUID of the installed provisioning profile whose signer should be trusted.
+        :return: The ``status`` value of the reply, or None if the device omitted it.
+        :raises AmfiError: if the device does not report success (e.g. no profile with that UUID).
+        """
+        service = await self._lockdown.start_lockdown_service(self.SERVICE_NAME)
+        resp = await service.send_recv_plist({"action": self.TRUST_APP_SIGNER, "input_profile_uuid": profile_uuid})
+        error = resp.get("Error")
+        if error is not None:
+            raise AmfiError(f"AMFI refused to trust the app signer of profile {profile_uuid}: {error}")
+        if not resp.get("success"):
+            raise AmfiError(f"The device did not trust the app signer of profile {profile_uuid}: {resp}")
+        status = resp.get("status")
+        return status if isinstance(status, bool) else None

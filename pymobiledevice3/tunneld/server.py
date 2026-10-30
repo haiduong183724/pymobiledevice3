@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import time
 import traceback
 import urllib.parse
@@ -63,18 +64,17 @@ from pymobiledevice3.utils import current_task_name as _current_task_name
 
 logger = logging.getLogger(__name__)
 
-# bugfix: after the device reboots, it might take some time for remoted to start answering the bonjour queries
-REATTEMPT_INTERVAL = 5
-REATTEMPT_COUNT = 5
-
 REMOTEPAIRING_INTERVAL = 5
 MOBDEV2_INTERVAL = 5
 
 # USB monitor will periodically forget what interfaces it has seen
 # and force a full rescan.  The value is number of iterations of the
 # inner loop (which sleeps one second each) before blowing away the
-# `previous_ips` cache.
+# `previous_ips` cache (the host-address fallback).
 USB_MONITOR_RESCAN_INTERVAL = 30
+# First wait before retrying a USB device's RSD address whose tunnel attempt failed; it doubles up to
+# USB_MONITOR_RESCAN_INTERVAL seconds.
+USB_RSD_RETRY_INTERVAL = 2.0
 
 USBMUX_INTERVAL = 2
 OSUTILS = get_os_utils()
@@ -239,47 +239,77 @@ class TunneldCore:
     @asyncio_print_traceback
     async def monitor_usb_task(self) -> None:
         try:
-            previous_ips = []
+            # The OS reports each USB device's RSD address once its link is up (IORegistry on macOS),
+            # so watch those. Without that (e.g. Linux, or macOS releases that don't flag the RSD
+            # interface), watch the host's IPv6 addresses and browse bonjour. Each way keeps its own
+            # "previous", so switching between them never makes one's addresses look removed.
+            previous_addresses: set[str] = set()
+            previous_ips: set[str] = set()
             iteration = 0
+            # Per RSD address: when it may be tried again, and how long the wait after that grows to.
+            # Right after boot a device accepts the connection before RSD answers (remoted retries every
+            # second), but one that never gets a tunnel must not have remoted suspended every few seconds.
+            retry: dict[str, tuple[float, float]] = {}
+            loop = asyncio.get_running_loop()
             while True:
                 iteration += 1
-                current_ips = OSUTILS.get_ipv6_ips()
-                added = [ip for ip in current_ips if ip not in previous_ips]
-                removed = [ip for ip in previous_ips if ip not in current_ips]
-
-                # periodically forget what we have seen so that we reattempt
-                # tunnels even if the interface didn't disappear / reappear
-                if iteration >= USB_MONITOR_RESCAN_INTERVAL:
-                    previous_ips = []
-                    iteration = 0
+                rsd_addresses = OSUTILS.usb_rsd_addresses()
+                if rsd_addresses is None:
+                    current = set(OSUTILS.get_ipv6_ips())
+                    added = current - previous_ips
+                    removed = previous_ips - current
+                    # periodically forget what we have seen so that we reattempt
+                    # tunnels even if the interface didn't disappear / reappear
+                    if iteration >= USB_MONITOR_RESCAN_INTERVAL:
+                        previous_ips = set()
+                        iteration = 0
+                    else:
+                        previous_ips = current
                 else:
-                    previous_ips = current_ips
-
-                # logger.debug(f'added interfaces: {added}')
-                # logger.debug(f'removed interfaces: {removed}')
+                    # failed attempts are retried below instead of by a periodic rescan
+                    current = set(rsd_addresses.values())
+                    added = current - previous_addresses
+                    removed = previous_addresses - current
+                    previous_addresses = current
 
                 for ip in removed:
+                    retry.pop(ip, None)
                     if ip in self.tunnel_tasks:
                         self.tunnel_tasks[ip].task.cancel()
                         with suppress(asyncio.CancelledError):
                             await self.tunnel_tasks[ip].task
 
-                if added:
-                    # A new interface was attached
-                    for answer in await browse_remoted():
-                        for address in answer.addresses:
-                            if address.iface.startswith("utun"):
-                                # Skip already established tunnels
-                                continue
-                            if address.full_ip in self.tunnel_tasks:
-                                # Skip already established tunnels
-                                continue
-                            self.tunnel_tasks[address.full_ip] = TunnelTask(
-                                task=asyncio.create_task(
-                                    self.handle_new_potential_usb_cdc_ncm_interface_task(address.full_ip),
-                                    name=f"handle-new-potential-usb-cdc-ncm-interface-task-{address.full_ip}",
-                                )
-                            )
+                addresses: list[str] = []
+                if rsd_addresses is None:
+                    if added:
+                        # skip already established tunnels: utunN on macOS, tunN on Linux
+                        addresses = [
+                            address.full_ip
+                            for answer in await browse_remoted(skip_interfaces=("utun", "tun"))
+                            for address in answer.addresses
+                        ]
+                else:
+                    now = loop.time()
+                    for udid, address in rsd_addresses.items():
+                        if self.tunnel_exists_for_udid(udid):
+                            # (possibly under another key, e.g. through usbmux)
+                            retry.pop(address, None)
+                            continue
+                        retry_at, delay = retry.get(address, (0.0, USB_RSD_RETRY_INTERVAL))
+                        if address in self.tunnel_tasks or now < retry_at:
+                            continue
+                        retry[address] = (now + delay, min(delay * 2, USB_MONITOR_RESCAN_INTERVAL))
+                        addresses.append(address)
+                for address in addresses:
+                    if address in self.tunnel_tasks:
+                        # Skip already established tunnels
+                        continue
+                    self.tunnel_tasks[address] = TunnelTask(
+                        task=asyncio.create_task(
+                            self.handle_new_potential_usb_cdc_ncm_interface_task(address),
+                            name=f"handle-new-potential-usb-cdc-ncm-interface-task-{address}",
+                        )
+                    )
 
                 # wait before re-iterating
                 await asyncio.sleep(1)
@@ -393,7 +423,7 @@ class TunneldCore:
                 await asyncio.sleep(USBMUX_INTERVAL)
             except (BlockingIOError, BinaryParseError, MuxException) as e:
                 # Connection lost - will reconnect on next iteration.
-                # MuxException("socket connection broken") is raised when usbmuxd drops the
+                # MuxException("usbmuxd closed the connection.") is raised when usbmuxd drops the
                 # listen socket on device replug/reboot (notably on Linux); reconnect instead
                 # of letting the monitor task die (see issue #1742).
                 logger.debug(f"usbmux connection error: {e}, reconnecting...")
@@ -815,7 +845,8 @@ class TunneldRunner:
                         )
                         self._tunneld_core.tunnel_tasks[task_identifier] = TunnelTask(task=task, udid=udid)
                         created_task = True
-                    except (ConnectionFailedError, InvalidServiceError, MuxException):
+                    except (ConnectionFailedError, DeviceNotFoundError, InvalidServiceError, MuxException):
+                        # e.g. the device is not attached over USB: try the other connection types
                         pass
                 if connection_type in ("usb", None):
                     for rsd in await get_rsds(udid=udid):
@@ -1097,8 +1128,10 @@ class TunneldRunner:
         return True
 
     def _run_app(self) -> None:
+        # uvicorn's "asyncio" loop factory always builds a ProactorEventLoop on win32, bypassing the
+        # selector policy pymobiledevice3 sets there (#1217, #1811); on the proactor loop the Wi-Fi
+        # monitor's bonjour browse gets no answers (#2051). "none" leaves the loop to that policy.
+        loop = "none" if sys.platform == "win32" else "asyncio"
         # per-message deflate would burn CPU compressing the mostly-encrypted tunnel
         # traffic bridged over /connect
-        uvicorn.run(
-            self._app, host=self.host, port=self.port, loop="asyncio", ws="wsproto", ws_per_message_deflate=False
-        )
+        uvicorn.run(self._app, host=self.host, port=self.port, loop=loop, ws="wsproto", ws_per_message_deflate=False)
