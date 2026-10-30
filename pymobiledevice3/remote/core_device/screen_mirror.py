@@ -265,6 +265,9 @@ class ScreenMirrorSession:
         # failure of the video feed / RTCP task, which ``_failure`` then records.
         self._stopped_event = asyncio.Event()
         self._failure: Optional[BaseException] = None
+        # Set once the single teardown (by stop() or a failed start()) has finished; every
+        # stop() after the first awaits it.
+        self._teardown_done = asyncio.Event()
         self._svc: Optional[DisplayService] = None
         self._transport: Optional[UdpMediaTransport] = None
         self._feed_task: Optional[asyncio.Task[None]] = None
@@ -985,8 +988,11 @@ class ScreenMirrorSession:
                 # here. Release the device session only if the stream came up -- a rejected
                 # start_video_stream left nothing to release on the device.
                 self._stopped = True
-                await self._teardown(release_device=self._started)
-                self._stopped_event.set()
+                try:
+                    await self._teardown(release_device=self._started)
+                finally:
+                    self._teardown_done.set()
+                    self._stopped_event.set()
             if isinstance(e, CoreDeviceError) and is_media_in_use_error(e):
                 # Camera/microphone in use: there is nothing to serve. Fail fast
                 # with a clean, actionable error (no traceback).
@@ -1135,10 +1141,13 @@ class ScreenMirrorSession:
         connections close concurrently within ``STOP_STEP_TIMEOUT``, then releasing the
         device-side media session gets ``STOP_ALL_STREAMS_TIMEOUT``. Called while :meth:`start`
         is still in flight, ``stop()`` cancels that ``start()`` (its caller then sees
-        ``asyncio.CancelledError``) and tears down what it had created. Once ``stop()``
-        returns, :meth:`wait_stopped` does too. The session cannot be started again.
+        ``asyncio.CancelledError``) and tears down what it had created. There is one teardown,
+        whoever runs it (the first ``stop()`` or a failed ``start()``): every ``stop()`` call
+        returns only once it has finished. Once ``stop()`` returns, :meth:`wait_stopped` does
+        too. The session cannot be started again.
         """
         if self._stopped:
+            await self._teardown_done.wait()
             return
         self._stopped = True
         try:
@@ -1150,6 +1159,7 @@ class ScreenMirrorSession:
                 start_task.cancel()
             await self._teardown(release_device=self._stream_requested, start_exited=self._start_exited)
         finally:
+            self._teardown_done.set()
             self._stopped_event.set()
 
     async def _drain_pli_tasks(self) -> None:

@@ -397,3 +397,30 @@ async def test_stop_is_bounded_when_a_device_call_ignores_cancellation(device, r
     finally:
         release.set()
         await asyncio.sleep(0)
+
+
+async def test_concurrent_stops_both_wait_for_the_teardown(device, rsd, fast_timeouts):
+    device.hang_stop_all = True
+    session = ScreenMirrorSession(rsd)
+    await session.start()
+    first = asyncio.create_task(session.stop())
+    second = asyncio.create_task(session.stop())
+    await asyncio.wait_for(second, 2)
+    assert first.done()  # the second stop() returned only once the one teardown had finished
+    assert device.stop_all_streams_calls == 1
+    assert [t.closed for t in device.transports] == [1]
+    assert await asyncio.wait_for(session.wait_stopped(), 0.01) is None
+
+
+async def test_stop_during_a_failed_start_waits_for_its_teardown(device, rsd, fast_timeouts):
+    device.start_error = OSError("tunnel gone")
+    device.hang_close = True  # keeps the failed start() inside its bounded teardown
+    session = ScreenMirrorSession(rsd)
+    start = asyncio.create_task(session.start())
+    while device.close_calls == 0:
+        await asyncio.sleep(0)
+    await asyncio.wait_for(session.stop(), 2)
+    assert start.done()
+    assert isinstance(start.exception(), OSError)
+    assert [t.closed for t in device.transports] == [1]
+    assert await asyncio.wait_for(session.wait_stopped(), 0.01) is None
